@@ -490,26 +490,21 @@ static void hci_num_completed_packets(struct net_buf *buf)
 	for (i = 0; i < evt->num_handles; i++) {
 		u16_t handle, count;
 		struct bt_conn *conn;
-		unsigned int key;
 
 		handle = sys_le16_to_cpu(evt->h[i].handle);
 		count = sys_le16_to_cpu(evt->h[i].count);
 
 		BT_DBG("handle %u count %u", handle, count);
 
-		key = irq_lock();
-
 		conn = bt_conn_lookup_handle(handle);
 		if (!conn) {
 			BT_ERR("No connection for handle %u", handle);
-			irq_unlock(key);
 			continue;
 		}
 
-		irq_unlock(key);
-
 		while (count--) {
 			sys_snode_t *node;
+			unsigned int key;
 
 			key = irq_lock();
 			node = sys_slist_get(&conn->tx_pending);
