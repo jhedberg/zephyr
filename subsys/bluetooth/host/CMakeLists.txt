@@ -3,7 +3,7 @@ zephyr_library_link_libraries(subsys__bluetooth)
 
 if(CONFIG_BT_INTERNAL_STORAGE)
   zephyr_library_sources(storage.c)
-  zephyr_library_link_libraries_ifdef(CONFIG_FAT_FILESYSTEM_ELM ELMFAT)
+  zephyr_library_link_libraries(subsys__fs)
 endif()
 
 zephyr_library_sources_ifdef(CONFIG_BT_HCI_RAW          hci_raw.c)
