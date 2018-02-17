@@ -1,0 +1,6 @@
+sample:
+  name: ZIP Halo
+tests:
+  test:
+    platform_whitelist: bbc_microbit
+    tags: samples
