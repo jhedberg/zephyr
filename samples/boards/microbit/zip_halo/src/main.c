@@ -119,9 +119,8 @@ static void send_buf(struct rgb rgb[], size_t len)
 #define ALL(name, color) struct rgb name[24] = { [ 0 ... 23 ] = color }
 #define ONE(name, color) struct rgb name[1] = { color }
 
-void main(void)
+static void led_test(void)
 {
-	struct mb_display *disp = mb_display_get();
 	ALL(dim, WHITE);
 	ONE(one_grey, GREY);
 	ONE(one_black, BLACK);
@@ -132,14 +131,6 @@ void main(void)
 	ALL(all_red, RED);
 	ALL(all_blue, BLUE);
 	int led;
-
-	/* Show a smiley-face */
-	mb_display_image(disp, MB_DISPLAY_MODE_SINGLE, K_SECONDS(1),
-			 &smiley, 1);
-	k_sleep(K_SECONDS(2));
-
-	led_gpio = device_get_binding(SW0_GPIO_NAME);
-	gpio_pin_configure(led_gpio, LED_PIN, GPIO_DIR_OUT);
 
 	send_buf(one_grey, ARRAY_SIZE(one_grey));
 	k_sleep(DELAY);
@@ -201,4 +192,90 @@ void main(void)
 	}
 
 	send_buf(all_black, ARRAY_SIZE(all_black));
+}
+
+static struct rgb level_state[24];
+
+static struct k_work level_work;
+
+static void level_changed(struct k_work *work)
+{
+	struct mb_display *disp = mb_display_get();
+	struct mb_image img = { };
+	int x, y, num_pix = level_state[0].r / 10;
+
+	if (!num_pix) {
+		goto done;
+	}
+
+	for (y = 4; y >= 0; y--) {
+		for (x = 0; x < 5; x++) {
+			img.row[y] |= BIT(x);
+			if (!--num_pix) {
+				goto done;
+			}
+		}
+	}
+
+done:
+	send_buf(level_state, ARRAY_SIZE(level_state));
+	mb_display_image(disp, MB_DISPLAY_MODE_SINGLE, K_FOREVER, &img, 1);
+}
+
+static void button_pressed(struct device *dev, struct gpio_callback *cb,
+			   u32_t pins)
+{
+	u8_t level = level_state[0].g;
+
+	/* Filter out spurious presses */
+	if (pins & BIT(SW0_GPIO_PIN)) {
+		printk("A pressed\n");
+		level -= 10;
+	} else {
+		printk("B pressed\n");
+		level += 10;
+	}
+
+	memset(level_state, level, sizeof(level_state));
+	k_work_submit(&level_work);
+}
+
+static void configure_buttons(void)
+{
+	static struct gpio_callback button_cb;
+	struct device *gpio;
+
+	k_work_init(&level_work, level_changed);
+
+	gpio = device_get_binding(SW0_GPIO_NAME);
+
+	gpio_pin_configure(gpio, SW0_GPIO_PIN,
+			   (GPIO_DIR_IN | GPIO_INT | GPIO_INT_EDGE |
+			    GPIO_INT_ACTIVE_LOW));
+	gpio_pin_configure(gpio, SW1_GPIO_PIN,
+			   (GPIO_DIR_IN | GPIO_INT | GPIO_INT_EDGE |
+			    GPIO_INT_ACTIVE_LOW));
+	gpio_init_callback(&button_cb, button_pressed,
+			   BIT(SW0_GPIO_PIN) | BIT(SW1_GPIO_PIN));
+	gpio_add_callback(gpio, &button_cb);
+
+	gpio_pin_enable_callback(gpio, SW0_GPIO_PIN);
+	gpio_pin_enable_callback(gpio, SW1_GPIO_PIN);
+}
+
+void main(void)
+{
+	struct mb_display *disp = mb_display_get();
+
+	/* Show a smiley-face */
+	mb_display_image(disp, MB_DISPLAY_MODE_SINGLE, K_SECONDS(1),
+			 &smiley, 1);
+	k_sleep(K_SECONDS(2));
+
+	led_gpio = device_get_binding(SW0_GPIO_NAME);
+	gpio_pin_configure(led_gpio, LED_PIN, GPIO_DIR_OUT);
+
+	led_test();
+
+	configure_buttons();
 }
