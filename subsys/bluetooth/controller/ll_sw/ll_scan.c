@@ -59,22 +59,12 @@ u32_t ll_scan_params_set(u8_t type, u16_t interval, u16_t window,
 
 u32_t ll_scan_enable(u8_t enable)
 {
-	u8_t rpa_gen = 0;
 	u32_t status;
-	u32_t scan;
+	u8_t  rpa_gen = 0;
 
 	if (!enable) {
-		return radio_scan_disable(true);
-	}
-
-	scan = ll_scan_is_enabled();
-
-	/* Initiator and scanning are not supported */
-	if (scan & BIT(2)) {
-	       return BT_HCI_ERR_CMD_DISALLOWED;
-	}
-
-	if (scan) {
+		return radio_scan_disable();
+	} else if (ll_scan_is_enabled()) {
 		/* Duplicate filtering is processed in the HCI layer */
 		return 0;
 	}
