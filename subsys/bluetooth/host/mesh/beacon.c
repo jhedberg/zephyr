@@ -27,14 +27,14 @@
 #include "beacon.h"
 #include "foundation.h"
 
-#define UNPROVISIONED_INTERVAL     K_SECONDS(5)
+#define UNPROVISIONED_INTERVAL     K_SECONDS(1)
 #define PROVISIONED_INTERVAL       K_SECONDS(10)
 
 #define BEACON_TYPE_UNPROVISIONED  0x00
 #define BEACON_TYPE_SECURE         0x01
 
 /* 3 transmissions, 20ms interval */
-#define UNPROV_XMIT                BT_MESH_TRANSMIT(2, 20)
+#define UNPROV_XMIT                BT_MESH_TRANSMIT(0, 20)
 
 /* 1 transmission, 20ms interval */
 #define PROV_XMIT                  BT_MESH_TRANSMIT(0, 20)

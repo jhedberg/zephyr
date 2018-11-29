@@ -14,6 +14,8 @@
 #include <bluetooth/bluetooth.h>
 #include <bluetooth/mesh.h>
 
+#include "../../controller/hal/nrf5/debug.h"
+
 #define BT_DBG_ENABLED IS_ENABLED(CONFIG_BT_MESH_DEBUG_FRIEND)
 #define LOG_MODULE_NAME bt_mesh_friend
 #include "common/log.h"
@@ -584,6 +586,8 @@ int bt_mesh_friend_poll(struct bt_mesh_net_rx *rx, struct net_buf_simple *buf)
 
 	BT_DBG("msg->fsn %u frnd->fsn %u", (msg->fsn & 1), frnd->fsn);
 
+	DEBUG_FRIEND_POLL(1);
+
 	friend_recv_delay(frnd);
 
 	if (!frnd->established) {
@@ -607,6 +611,8 @@ int bt_mesh_friend_poll(struct bt_mesh_net_rx *rx, struct net_buf_simple *buf)
 			BT_DBG("Enqueued Friend Update to empty queue");
 		}
 	}
+
+	DEBUG_FRIEND_POLL(0);
 
 	return 0;
 }
@@ -1018,6 +1024,8 @@ static void friend_timeout(struct k_work *work)
 		.end = buf_send_end,
 	};
 
+	DEBUG_FRIEND_TIMEOUT(1);
+
 	__ASSERT_NO_MSG(frnd->pending_buf == 0);
 
 	BT_DBG("lpn 0x%04x send_last %u last %p", frnd->lpn,
@@ -1032,6 +1040,7 @@ static void friend_timeout(struct k_work *work)
 	if (frnd->established && !frnd->pending_req) {
 		BT_WARN("Friendship lost with 0x%04x", frnd->lpn);
 		friend_clear(frnd);
+		DEBUG_FRIEND_TIMEOUT(0);
 		return;
 	}
 
@@ -1039,6 +1048,7 @@ static void friend_timeout(struct k_work *work)
 	if (!frnd->last) {
 		BT_WARN("Friendship not established with 0x%04x", frnd->lpn);
 		friend_clear(frnd);
+		DEBUG_FRIEND_TIMEOUT(0);
 		return;
 	}
 
@@ -1050,6 +1060,7 @@ send_last:
 	frnd->pending_req = 0;
 	frnd->pending_buf = 1;
 	bt_mesh_adv_send(frnd->last, &buf_sent_cb, frnd);
+	DEBUG_FRIEND_TIMEOUT(0);
 }
 
 int bt_mesh_friend_init(void)

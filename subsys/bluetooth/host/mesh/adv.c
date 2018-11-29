@@ -17,6 +17,8 @@
 #include <bluetooth/conn.h>
 #include <bluetooth/mesh.h>
 
+#include "../../controller/hal/nrf5/debug.h"
+
 #define BT_DBG_ENABLED IS_ENABLED(CONFIG_BT_MESH_DEBUG_ADV)
 #define LOG_MODULE_NAME bt_mesh_adv
 #include "common/log.h"
@@ -129,6 +131,8 @@ static inline void adv_send(struct net_buf *buf)
 	param.interval_min = ADV_SCAN_UNIT(adv_int);
 	param.interval_max = param.interval_min;
 
+	DEBUG_ADV_START(1);
+
 	err = bt_le_adv_start(&param, &ad, 1, NULL, 0);
 	net_buf_unref(buf);
 	adv_send_start(duration, err, cb, cb_data);
@@ -137,9 +141,13 @@ static inline void adv_send(struct net_buf *buf)
 		return;
 	}
 
+	DEBUG_ADV_START(0);
+
 	BT_DBG("Advertising started. Sleeping %u ms", duration);
 
 	k_sleep(K_MSEC(duration));
+
+	DEBUG_ADV_STOP(1);
 
 	err = bt_le_adv_stop();
 	adv_send_end(err, cb, cb_data);
@@ -147,6 +155,8 @@ static inline void adv_send(struct net_buf *buf)
 		BT_ERR("Stopping advertising failed: err %d", err);
 		return;
 	}
+
+	DEBUG_ADV_STOP(0);
 
 	BT_DBG("Advertising stopped");
 }
@@ -240,6 +250,8 @@ struct net_buf *bt_mesh_adv_create(enum bt_mesh_adv_type type, u8_t xmit,
 void bt_mesh_adv_send(struct net_buf *buf, const struct bt_mesh_send_cb *cb,
 		      void *cb_data)
 {
+	DEBUG_ADV_QUEUE(1);
+
 	BT_DBG("type 0x%02x len %u: %s", BT_MESH_ADV(buf)->type, buf->len,
 	       bt_hex(buf->data, buf->len));
 
@@ -248,6 +260,8 @@ void bt_mesh_adv_send(struct net_buf *buf, const struct bt_mesh_send_cb *cb,
 	BT_MESH_ADV(buf)->busy = 1;
 
 	net_buf_put(&adv_queue, net_buf_ref(buf));
+
+	DEBUG_ADV_QUEUE(0);
 }
 
 static void bt_mesh_scan_cb(const bt_addr_le_t *addr, s8_t rssi,

@@ -5,6 +5,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <soc.h>
+
 #ifdef CONFIG_BT_CTLR_DEBUG_PINS
 #if defined(CONFIG_BOARD_NRF52840_PCA10056)
 #define DEBUG_PORT       NRF_P1
@@ -61,7 +63,12 @@
 				DEBUG_PORT->OUTCLR = DEBUG_PIN_MASK; } \
 				while (0)
 
-#define DEBUG_CPU_SLEEP(flag)   do { \
+#define DEBUG_CPU_SLEEP(flag)
+#define DEBUG_TICKER_ISR(flag)
+#define DEBUG_TICKER_TASK(flag)
+#define DEBUG_TICKER_JOB(flag)
+
+#define DEBUG_ADV_QUEUE(flag)   do { \
 				if (flag) { \
 				DEBUG_PORT->OUTSET = DEBUG_PIN0; \
 				DEBUG_PORT->OUTCLR = DEBUG_PIN0; } \
@@ -70,7 +77,7 @@
 				DEBUG_PORT->OUTSET = DEBUG_PIN0; } \
 				} while (0)
 
-#define DEBUG_TICKER_ISR(flag)   do { \
+#define DEBUG_ADV_START(flag)   do { \
 				if (flag) { \
 				DEBUG_PORT->OUTCLR = DEBUG_PIN1; \
 				DEBUG_PORT->OUTSET = DEBUG_PIN1; } \
@@ -79,16 +86,7 @@
 				DEBUG_PORT->OUTCLR = DEBUG_PIN1; } \
 				} while (0)
 
-#define DEBUG_TICKER_TASK(flag)  do { \
-				if (flag) { \
-				DEBUG_PORT->OUTCLR = DEBUG_PIN1; \
-				DEBUG_PORT->OUTSET = DEBUG_PIN1; } \
-				else { \
-				DEBUG_PORT->OUTSET = DEBUG_PIN1; \
-				DEBUG_PORT->OUTCLR = DEBUG_PIN1; } \
-				} while (0)
-
-#define DEBUG_TICKER_JOB(flag)   do { \
+#define DEBUG_ADV_STOP(flag)   do { \
 				if (flag) { \
 				DEBUG_PORT->OUTCLR = DEBUG_PIN2; \
 				DEBUG_PORT->OUTSET = DEBUG_PIN2; } \
@@ -150,16 +148,10 @@
 				DEBUG_PORT->OUTSET = DEBUG_PIN3; } \
 				} while (0)
 
-#define DEBUG_RADIO_PREPARE_S(flag) do { \
-				if (flag) { \
-				DEBUG_PORT->OUTCLR = DEBUG_PIN4; \
-				DEBUG_PORT->OUTSET = DEBUG_PIN4; } \
-				else { \
-				DEBUG_PORT->OUTCLR = DEBUG_PIN4; \
-				DEBUG_PORT->OUTSET = DEBUG_PIN4; } \
-				} while (0)
+#define DEBUG_RADIO_PREPARE_S(flag)
+#define DEBUG_RADIO_START_S(flag)
 
-#define DEBUG_RADIO_START_S(flag)   do { \
+#define DEBUG_FRIEND_TIMEOUT(flag)   do { \
 				if (flag) { \
 				DEBUG_PORT->OUTCLR = DEBUG_PIN4; \
 				DEBUG_PORT->OUTSET = DEBUG_PIN4; } \
@@ -186,16 +178,10 @@
 				DEBUG_PORT->OUTSET = DEBUG_PIN5; } \
 				} while (0)
 
-#define DEBUG_RADIO_PREPARE_M(flag) do { \
-				if (flag) { \
-				DEBUG_PORT->OUTCLR = DEBUG_PIN6; \
-				DEBUG_PORT->OUTSET = DEBUG_PIN6; } \
-				else { \
-				DEBUG_PORT->OUTCLR = DEBUG_PIN6; \
-				DEBUG_PORT->OUTSET = DEBUG_PIN6; } \
-				} while (0)
+#define DEBUG_RADIO_PREPARE_M(flag)
+#define DEBUG_RADIO_START_M(flag)
 
-#define DEBUG_RADIO_START_M(flag)   do { \
+#define DEBUG_FRIEND_POLL(flag)   do { \
 				if (flag) { \
 				DEBUG_PORT->OUTCLR = DEBUG_PIN6; \
 				DEBUG_PORT->OUTSET = DEBUG_PIN6; } \
