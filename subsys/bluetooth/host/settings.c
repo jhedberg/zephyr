@@ -90,6 +90,8 @@ static int set(int argc, char **argv, void *value_ctx)
 {
 	int len;
 
+	BT_DBG("argv[0] %s", log_strdup(argv[0]));
+
 	if (argc > 1) {
 		const struct bt_settings_handler *h;
 
@@ -112,9 +114,9 @@ static int set(int argc, char **argv, void *value_ctx)
 			return 0;
 		}
 
-		len = sizeof(bt_dev.id_addr);
-
-		len = settings_val_read_cb(value_ctx, &bt_dev.id_addr, len);
+		len = settings_val_read_cb(value_ctx, &bt_dev.id_addr,
+					   sizeof(bt_dev.id_addr));
+		BT_DBG("got %d bytes id value", len);
 
 		if (len < sizeof(bt_dev.id_addr[0])) {
 			if (len < 0) {
@@ -161,6 +163,7 @@ static int set(int argc, char **argv, void *value_ctx)
 	if (!strcmp(argv[0], "irk")) {
 		len = settings_val_read_cb(value_ctx, bt_dev.irk,
 					   sizeof(bt_dev.irk));
+		BT_DBG("got %d bytes irk value", len);
 		if (len < sizeof(bt_dev.irk[0])) {
 			if (len < 0) {
 				BT_ERR("Failed to read IRK from storage"
@@ -170,7 +173,13 @@ static int set(int argc, char **argv, void *value_ctx)
 				(void)memset(bt_dev.irk, 0, sizeof(bt_dev.irk));
 			}
 		} else {
-			BT_DBG("IRK set to %s", bt_hex(bt_dev.irk[0], 16));
+			int i, count;
+
+			count = len / sizeof(bt_dev.irk[0]);
+			for (i = 0; i < count; i++) {
+				BT_DBG("IRK[%d] set to %s", i,
+				       bt_hex(bt_dev.irk[i], 16));
+			}
 		}
 
 		return 0;
@@ -180,26 +189,27 @@ static int set(int argc, char **argv, void *value_ctx)
 	return 0;
 }
 
-#if defined(CONFIG_BT_PRIVACY)
-#define ID_SIZE_MAX sizeof(bt_dev.irk)
-#else
-#define ID_SIZE_MAX sizeof(bt_dev.id_addr)
-#endif
-
 #define ID_DATA_LEN(array) (bt_dev.id_count * sizeof(array[0]))
 
 static void save_id(struct k_work *work)
 {
-	BT_DBG("Saving ID addr");
-	BT_HEXDUMP_DBG(&bt_dev.id_addr, ID_DATA_LEN(bt_dev.id_addr),
-		       "ID addr");
-	settings_save_one("bt/id", &bt_dev.id_addr,
+	int err;
+
+	BT_DBG("Saving ID (%zu bytes): %s", ID_DATA_LEN(bt_dev.id_addr),
+	       bt_hex(bt_dev.id_addr, ID_DATA_LEN(bt_dev.id_addr)));
+	err = settings_save_one("bt/id", &bt_dev.id_addr,
 			  ID_DATA_LEN(bt_dev.id_addr));
+	if (err) {
+		BT_ERR("Failed to save ID (err %d)", err);
+	}
 
 #if defined(CONFIG_BT_PRIVACY)
-	BT_DBG("Saving IRK");
-	BT_HEXDUMP_DBG(bt_dev.irk, ID_DATA_LEN(bt_dev.irk), "IRK");
-	settings_save_one("bt/irk", bt_dev.irk, ID_DATA_LEN(bt_dev.irk));
+	BT_DBG("Saving IRK (%zu bytes): %s", ID_DATA_LEN(bt_dev.irk),
+	       bt_hex(bt_dev.irk, ID_DATA_LEN(bt_dev.irk)));
+	err = settings_save_one("bt/irk", bt_dev.irk, ID_DATA_LEN(bt_dev.irk));
+	if (err) {
+		BT_ERR("Failed to save IRK (err %d)", err);
+	}
 #endif
 }
 
