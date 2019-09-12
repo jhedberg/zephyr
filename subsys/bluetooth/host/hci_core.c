@@ -876,6 +876,11 @@ static void hci_disconn_complete(struct net_buf *buf)
 		return;
 	}
 
+	/* Make sure we don't leave a left-over reference if/when this
+	 * connection object gets reused.
+	 */
+	conn->le.keys = NULL;
+
 #if defined(CONFIG_BT_CENTRAL) && !defined(CONFIG_BT_WHITELIST)
 	if (atomic_test_bit(conn->flags, BT_CONN_AUTO_CONNECT)) {
 		bt_conn_set_state(conn, BT_CONN_CONNECT_SCAN);

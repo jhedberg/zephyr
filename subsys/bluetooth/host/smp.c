@@ -1722,6 +1722,7 @@ static void smp_timeout(struct k_work *work)
 	if (atomic_test_bit(smp->flags, SMP_FLAG_KEYS_DISTR) &&
 	    smp->chan.chan.conn->le.keys) {
 		bt_keys_clear(smp->chan.chan.conn->le.keys);
+		smp->chan.chan.conn->le.keys = NULL;
 	}
 
 	atomic_set_bit(smp->flags, SMP_FLAG_TIMEOUT);
@@ -3350,6 +3351,7 @@ static u8_t smp_pairing_failed(struct bt_smp *smp, struct net_buf *buf)
 	if (atomic_test_bit(smp->flags, SMP_FLAG_KEYS_DISTR) &&
 	    smp->chan.chan.conn->le.keys) {
 		bt_keys_clear(smp->chan.chan.conn->le.keys);
+		smp->chan.chan.conn->le.keys = NULL;
 	}
 
 	smp_pairing_complete(smp, req->reason);
