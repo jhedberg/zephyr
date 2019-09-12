@@ -205,6 +205,11 @@ void bt_keys_clear(struct bt_keys *keys)
 {
 	BT_DBG("%s (keys 0x%04x)", bt_addr_le_str(&keys->addr), keys->keys);
 
+	if (!keys->keys) {
+		BT_WARN("No keys for %s", bt_addr_le_str(&keys->addr));
+		return;
+	}
+
 	if (keys->keys & BT_KEYS_IRK) {
 		bt_id_del(keys);
 	}
