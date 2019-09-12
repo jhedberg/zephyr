@@ -209,7 +209,7 @@ void bt_keys_clear(struct bt_keys *keys)
 		bt_id_del(keys);
 	}
 
-	if (IS_ENABLED(CONFIG_BT_SETTINGS)) {
+	if (IS_ENABLED(CONFIG_BT_SETTINGS) && (keys->flags & BT_KEYS_STORED)) {
 		char key[BT_SETTINGS_KEY_MAX];
 
 		/* Delete stored keys from flash */
@@ -271,6 +271,8 @@ int bt_keys_store(struct bt_keys *keys)
 		BT_ERR("Failed to save keys (err %d)", err);
 		return err;
 	}
+
+	keys->flags |= BT_KEYS_STORED;
 
 	BT_DBG("Stored keys for %s (%s)", bt_addr_le_str(&keys->addr),
 	       log_strdup(key));
@@ -344,6 +346,8 @@ static int keys_set(const char *name, size_t len_rd, settings_read_cb read_cb,
 	} else {
 		memcpy(keys->storage_start, val, len);
 	}
+
+	keys->flags |= BT_KEYS_STORED;
 
 	BT_DBG("Successfully restored keys for %s", bt_addr_le_str(&addr));
 	return 0;
