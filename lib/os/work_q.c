@@ -29,7 +29,9 @@ void z_work_q_main(void *work_q_ptr, void *p2, void *p3)
 		/* Reset pending state so it can be resubmitted by handler */
 		if (atomic_test_and_clear_bit(work->flags,
 					      K_WORK_STATE_PENDING)) {
+			//printk("WORK %p\n", handler);
 			handler(work);
+			//printk("WORK done %p\n", handler);
 		}
 
 		/* Make sure we don't hog up the CPU if the FIFO never (or

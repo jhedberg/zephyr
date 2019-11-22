@@ -123,7 +123,7 @@ static void prio_recv_thread(void *p1, void *p2, void *p3)
 			buf = bt_buf_get_evt(BT_HCI_EVT_NUM_COMPLETED_PACKETS,
 					     false, K_FOREVER);
 			hci_num_cmplt_encode(buf, handle, num_cmplt);
-			BT_DBG("Num Complete: 0x%04x:%u", handle, num_cmplt);
+			//BT_WARN("Num Complete: 0x%04x:%u", handle, num_cmplt);
 			bt_recv_prio(buf);
 			k_yield();
 #endif
@@ -430,9 +430,10 @@ static int cmd_handle(struct net_buf *buf)
 	struct node_rx_pdu *node_rx = NULL;
 	struct net_buf *evt;
 
+	//BT_WARN("handle");
 	evt = hci_cmd_handle(buf, (void **) &node_rx);
 	if (evt) {
-		BT_DBG("Replying with event of %u bytes", evt->len);
+		//BT_WARN("Replying with event of %u bytes", evt->len);
 		bt_recv_prio(evt);
 
 		if (node_rx) {
