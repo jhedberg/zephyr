@@ -1824,6 +1824,11 @@ void bt_conn_disconnect_all(u8_t id)
 
 struct bt_conn *bt_conn_ref(struct bt_conn *conn)
 {
+	if (!atomic_get(&conn->ref)) {
+		BT_ERR("zero reference conn!");
+		return NULL;
+	}
+
 	atomic_inc(&conn->ref);
 
 	BT_DBG("handle %u ref %u", conn->handle, atomic_get(&conn->ref));
