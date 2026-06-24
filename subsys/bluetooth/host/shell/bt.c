@@ -1716,6 +1716,13 @@ static int bt_do_scan_off(void)
 	/* Cancel the potentially pending scan timeout work */
 	(void)k_work_cancel_delayable(&active_scan_timeout_work);
 
+#if defined(CONFIG_BT_CENTRAL)
+	if (auto_connect.connect_name) {
+		auto_connect.connect_name= false;
+		bt_do_scan_filter_clear_name();
+	}
+#endif /* CONFIG_BT_CENTRAL */
+
 	err = bt_le_scan_stop();
 
 	return err;
@@ -3752,6 +3759,11 @@ static int cmd_connect_le_name(const struct shell *sh, size_t argc, char *argv[]
 		.timeout    = 0,
 	};
 	int err;
+
+	if (auto_connect.connect_name) {
+		shell_error(sh, "Already scanning for name. Use \"bt scan off\" first.");
+		return -EALREADY;
+	}
 
 	/* Set the name filter which we will use in the scan callback to
 	 * automatically connect to the first device that passes the filter
