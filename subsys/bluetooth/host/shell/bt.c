@@ -1711,8 +1711,6 @@ static int cmd_passive_scan_on(const struct shell *sh, uint32_t options,
 
 static int bt_do_scan_off(void)
 {
-	int err;
-
 	/* Cancel the potentially pending scan timeout work */
 	(void)k_work_cancel_delayable(&active_scan_timeout_work);
 
@@ -1723,9 +1721,7 @@ static int bt_do_scan_off(void)
 	}
 #endif /* CONFIG_BT_CENTRAL */
 
-	err = bt_le_scan_stop();
-
-	return err;
+	return bt_le_scan_stop();
 }
 
 static int cmd_scan_off(const struct shell *sh)
