@@ -1929,6 +1929,14 @@ Devicetree
 Other notable changes
 *********************
 
+* Bluetooth
+
+  * Host
+
+    * :c:func:`bt_id_create` reuses the lowest identity handle released by :c:func:`bt_id_delete`
+      before allocating a new one, and :c:func:`bt_id_delete` no longer reduces the count reported
+      by :c:func:`bt_id_get`. See the :ref:`migration guide <migration_4.5>`.
+
 * Build system
 
   * The minimum required CMake version has been raised to 3.28.0, a version satisfied by the CMake package in the

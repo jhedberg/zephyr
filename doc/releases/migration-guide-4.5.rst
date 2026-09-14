@@ -1966,6 +1966,14 @@ Bluetooth Host
   :c:func:`bt_le_ext_adv_update_param`. Previously it kept the value from
   :c:func:`bt_le_ext_adv_create` even though the controller applied the new one.
 
+* :c:func:`bt_id_create` now returns the lowest free identity handle, so a handle released by
+  :c:func:`bt_id_delete` is reused before a new one is allocated, and :c:func:`bt_id_delete` no
+  longer reduces the count reported by :c:func:`bt_id_get` when the highest handle is deleted.
+  Previously only a handle below the highest one was kept as a deleted slot, and such a slot could
+  be taken back into use only with :c:func:`bt_id_reset`. Applications must use the handle returned
+  by :c:func:`bt_id_create` instead of assuming it is the previous count, and treat
+  ``BT_ADDR_LE_ANY`` entries returned by :c:func:`bt_id_get` as deleted.
+
 Bluetooth Mesh
 ==============
 
