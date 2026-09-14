@@ -452,10 +452,12 @@ int bt_set_appearance(uint16_t new_appearance);
  * simply the index of the identity address in the @a addrs array.
  *
  * If @a addrs is passed as NULL, then the returned @a count contains the
- * count of all available identity addresses that can be retrieved with a
- * subsequent call to this function with non-NULL @a addrs parameter.
+ * number of identity handles allocated so far, deleted ones included, which is
+ * the number of entries a subsequent call to this function with a non-NULL
+ * @a addrs parameter returns.
  *
- * @note Deleted identity addresses may show up as @ref BT_ADDR_LE_ANY in the returned array.
+ * @note An identity address deleted with @ref bt_id_delete shows up as @ref BT_ADDR_LE_ANY in the
+ * returned array until its handle is taken back into use.
  *
  * @param addrs Array where to store the configured identity addresses.
  * @param count Should be initialized to the array size. Once the function returns
@@ -487,6 +489,9 @@ void bt_id_get(bt_addr_le_t *addrs, size_t *count);
  * If an insufficient amount of identity addresses were recovered the app may then
  * call this function to create new ones.
  *
+ * The returned handle is the lowest free one: a handle released by @ref bt_id_delete
+ * is reused before a new one is allocated.
+ *
  * @note If @kconfig{CONFIG_BT_HCI_SET_PUBLIC_ADDR} is enabled, the first call can set a
  * public address as the controller's identity, but only before @ref bt_enable and if
  * no other identities exist.
@@ -513,12 +518,13 @@ int bt_id_create(bt_addr_le_t *addr, uint8_t *irk);
  * When given an existing identity handle, this function will disconnect any connections (to the
  * corresponding identity address) created using it, remove any pairing keys or other data
  * associated with it, and then create a new identity address in the same slot, based on the @a addr
- * and @a irk parameters.
+ * and @a irk parameters. A handle deleted with @ref bt_id_delete is accepted as well, in which
+ * case the new identity address takes the handle back into use.
  *
  * @note The default identity address (corresponding to @ref BT_ID_DEFAULT) cannot be reset, and
  * this API will return an error if asked to do that.
  *
- * @param id   Existing identity handle.
+ * @param id   Identity handle, in use or deleted.
  * @param addr Address to use for the new identity address. If NULL or initialized
  *             to BT_ADDR_LE_ANY the stack will generate a new static random
  *             address for the identity address and copy it to the given
@@ -540,14 +546,15 @@ int bt_id_reset(uint8_t id, bt_addr_le_t *addr, uint8_t *irk);
  *
  * When given a valid identity handle this function will disconnect any connections
  * (to the corresponding identity address) created using it, remove any pairing keys
- * or other data associated with it, and then flag is as deleted, so that it can not
- * be used for any operations. To take back into use the slot the identity address was
- * occupying, the @ref bt_id_reset API needs to be used.
+ * or other data associated with it, and then flag it as deleted, so that it can not
+ * be used for any operations. @ref bt_id_get reports a deleted identity address as
+ * @ref BT_ADDR_LE_ANY. The handle is free afterwards: @ref bt_id_create reuses free
+ * handles, lowest first, and @ref bt_id_reset takes a specific one back into use.
  *
  * @note The default identity address (corresponding to @ref BT_ID_DEFAULT) cannot be deleted, and
  * this API will return an error if asked to do that.
  *
- * @param id   Existing identity handle.
+ * @param id   Identity handle in use.
  *
  * @return 0 in case of success, or a negative error code on failure.
  */

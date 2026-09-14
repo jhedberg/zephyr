@@ -1379,7 +1379,9 @@ static int id_create(uint8_t id, bt_addr_le_t *addr, uint8_t *irk)
 
 int bt_id_create(bt_addr_le_t *addr, uint8_t *irk)
 {
-	int new_id, err;
+	bool new_slot = false;
+	uint8_t new_id;
+	int err;
 
 	if (!IS_ENABLED(CONFIG_BT_PRIVACY) && irk) {
 		return -EINVAL;
@@ -1405,8 +1407,19 @@ int bt_id_create(bt_addr_le_t *addr, uint8_t *irk)
 		}
 	}
 
-	if (bt_dev.id_count == ARRAY_SIZE(bt_dev.id_addr)) {
-		return -ENOMEM;
+	/* Reuse the lowest handle released by bt_id_delete() before taking a new one */
+	for (new_id = 0U; new_id < bt_dev.id_count; new_id++) {
+		if (bt_addr_le_eq(&bt_dev.id_addr[new_id], BT_ADDR_LE_ANY)) {
+			break;
+		}
+	}
+
+	if (new_id == bt_dev.id_count) {
+		if (bt_dev.id_count == ARRAY_SIZE(bt_dev.id_addr)) {
+			return -ENOMEM;
+		}
+
+		new_slot = true;
 	}
 
 	/* bt_rand is not available before Bluetooth enable has been called */
@@ -1423,10 +1436,18 @@ int bt_id_create(bt_addr_le_t *addr, uint8_t *irk)
 		}
 	}
 
-	new_id = bt_dev.id_count++;
+	if (new_slot) {
+		bt_dev.id_count++;
+	}
+
 	err = id_create(new_id, addr, irk);
-	if (err) {
-		bt_dev.id_count--;
+	if (err != 0) {
+		/* id_create() may have stored the address before failing */
+		bt_addr_le_copy(&bt_dev.id_addr[new_id], BT_ADDR_LE_ANY);
+		if (new_slot) {
+			bt_dev.id_count--;
+		}
+
 		return err;
 	}
 
@@ -1520,10 +1541,6 @@ int bt_id_delete(uint8_t id)
 	(void)memset(bt_dev.irk[id], 0, 16);
 #endif
 	bt_addr_le_copy(&bt_dev.id_addr[id], BT_ADDR_LE_ANY);
-
-	if (id == bt_dev.id_count - 1) {
-		bt_dev.id_count--;
-	}
 
 	if (IS_ENABLED(CONFIG_BT_SETTINGS) &&
 	    atomic_test_bit(bt_dev.flags, BT_DEV_READY)) {
