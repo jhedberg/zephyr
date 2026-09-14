@@ -1316,6 +1316,11 @@ static int id_find(const bt_addr_le_t *addr)
 	return -ENOENT;
 }
 
+static bool id_in_use(uint8_t id)
+{
+	return id < bt_dev.id_count && !bt_addr_le_eq(&bt_dev.id_addr[id], BT_ADDR_LE_ANY);
+}
+
 static int id_create(uint8_t id, bt_addr_le_t *addr, uint8_t *irk)
 {
 	if (addr && !bt_addr_le_eq(addr, BT_ADDR_LE_ANY)) {
@@ -2134,7 +2139,7 @@ int bt_le_oob_get_local(uint8_t id, struct bt_le_oob *oob)
 		return -EAGAIN;
 	}
 
-	if (id >= CONFIG_BT_ID_MAX) {
+	if (!id_in_use(id)) {
 		return -EINVAL;
 	}
 
