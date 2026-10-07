@@ -11,6 +11,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/arch/posix/posix_soc_if.h>
+#include <zephyr/bluetooth/addr.h>
 
 #include "util/mem.h"
 
@@ -24,10 +25,25 @@
 #include "ll_sw/pdu_df.h"
 #include "lll/pdu_vendor.h"
 #include "ll_sw/pdu.h"
+#include "ll_sw/lll_filter.h"
 
 #include "bs_2g4_radio_if.h"
 
 #include "hal/debug.h"
+
+/* The interrupt lines of the radio model may be borrowed from peripherals
+ * unused with this LLL, e.g. RTC0 on nRF, which is disabled by default.
+ * Make sure it is not enabled for a counter driver to claim the same line.
+ */
+#define BSR_IRQ_USED(n) (((n) == HAL_RADIO_IRQn) || ((n) == HAL_RTC_IRQn) || \
+			 ((n) == HAL_SWI_RADIO_IRQ) || \
+			 ((n) == DT_IRQ_BY_NAME(HAL_BSR_NODE, swi_ull_low, irq)))
+#define BSR_NODE_IRQ_CLASH(label) \
+	COND_CODE_1(DT_NODE_HAS_STATUS_OKAY(DT_NODELABEL(label)), \
+		    (BSR_IRQ_USED(DT_IRQN(DT_NODELABEL(label)))), (0))
+
+BUILD_ASSERT(!BSR_NODE_IRQ_CLASH(rtc0),
+	     "An enabled node uses an interrupt line of the bsim 2G4 radio");
 
 enum trx {
 	TRX_NONE,
@@ -85,9 +101,9 @@ static struct {
 	uint32_t end;
 
 	/* Device address filter */
-	uint8_t filter_enable;
-	uint8_t filter_addr_type;
-	uint8_t filter_addr[8][BDADDR_SIZE];
+	uint16_t filter_enable;
+	uint16_t filter_addr_type;
+	uint8_t filter_addr[LLL_FILTER_SIZE][BDADDR_SIZE];
 	bool filter_match;
 	uint8_t filter_match_idx;
 } r;
@@ -301,6 +317,15 @@ void radio_reset(void)
 	}
 	r.disabled_irq = false;
 	radio_status_reset();
+
+	/* CCM and AAR are not part of the nRF RADIO, but in this HAL they are
+	 * set up per PDU, so a power cycle must not leave them armed for a
+	 * later role using the scratch buffer.
+	 */
+#if defined(CONFIG_BT_CTLR_LE_ENC)
+	radio_ccm_disable();
+#endif /* CONFIG_BT_CTLR_LE_ENC */
+	radio_ar_status_reset();
 
 	r.tifs = EVENT_IFS_US;
 	r.cfg.tx_power = RADIO_TXP_DEFAULT;
@@ -597,7 +622,7 @@ uint32_t radio_rssi_is_ready(void)
 	return r.rssi_ready;
 }
 
-void radio_filter_configure(uint8_t bitmask_enable, uint8_t bitmask_addr_type,
+void radio_filter_configure(uint16_t bitmask_enable, uint16_t bitmask_addr_type,
 			    uint8_t *bdaddr)
 {
 	r.filter_enable = bitmask_enable;
@@ -987,8 +1012,12 @@ static void ccm_rx_decrypt(void)
 		return;
 	}
 
+	/* Too short to hold a MIC: keep the length so that the LLL checks the
+	 * MIC, which is reported as invalid.
+	 */
 	if (len <= CCM_MIC_LEN) {
-		out[1] = 0U;
+		out[1] = len;
+		memcpy(&out[2], &in[2], len);
 		return;
 	}
 
@@ -1113,10 +1142,13 @@ static void ar_rx_end(bool crc_ok, const uint8_t *pkt)
 		return;
 	}
 
-	if (crc_ok && (pkt[1] >= BDADDR_SIZE)) {
+	/* Only a random (TxAdd) resolvable private address can resolve */
+	if (crc_ok && (pkt[1] >= BDADDR_SIZE) && (pkt[0] & BIT(6)) &&
+	    ((pkt[2 + 5] & 0xC0) == 0x40)) {
 		(void)ar_resolve(&pkt[2]);
 	} else {
 		ar.resolved = false;
+		ar.match = 0U;
 	}
 }
 
@@ -1140,6 +1172,8 @@ uint32_t radio_ar_match_get(void)
 void radio_ar_status_reset(void)
 {
 	ar.enabled = false;
+	ar.resolved = false;
+	ar.match = 0U;
 }
 
 uint32_t radio_ar_has_match(void)

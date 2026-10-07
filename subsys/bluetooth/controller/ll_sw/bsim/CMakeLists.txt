@@ -28,6 +28,10 @@ if(CONFIG_BT_CONN)
     lll/lll_central.c
     )
 endif()
+zephyr_library_sources_ifdef(
+  CONFIG_BT_CTLR_PROFILE_ISR
+  lll/lll_prof.c
+  )
 
 # The software AES in ecb.c is also used by the radio HAL for CCM and
 # address resolution.

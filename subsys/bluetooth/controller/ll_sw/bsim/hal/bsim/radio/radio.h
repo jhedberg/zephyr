@@ -136,7 +136,7 @@ uint32_t radio_rssi_get(void);
 void radio_rssi_status_reset(void);
 uint32_t radio_rssi_is_ready(void);
 
-void radio_filter_configure(uint8_t bitmask_enable, uint8_t bitmask_addr_type,
+void radio_filter_configure(uint16_t bitmask_enable, uint16_t bitmask_addr_type,
 			    uint8_t *bdaddr);
 void radio_filter_disable(void);
 void radio_filter_status_reset(void);

@@ -459,7 +459,11 @@ static void rx_start(struct op *op)
 	req->coding_rate = 0;
 	req->pream_and_addr_duration = pream_and_addr_us(op->cfg.phy);
 	req->header_duration = bytes_us(op->cfg.phy, BSR_PDU_HEADER_LEN);
-	req->header_threshold = 0;
+	/* Never stop at the header: bit errors in it are reported at the end of
+	 * the packet as a CRC error, as if the length was received correctly,
+	 * which is what the nRF RADIO model does too.
+	 */
+	req->header_threshold = 0xFFFF;
 	req->sync_threshold = 2;
 	req->acceptable_pre_truncation = 0;
 	req->prelocked_tx = false;
