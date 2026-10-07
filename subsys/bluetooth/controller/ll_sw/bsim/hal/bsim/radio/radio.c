@@ -118,6 +118,8 @@ static inline void ccm_rx_commit(void) {}
 static inline void ccm_rx_end(bool crc_ok) { ARG_UNUSED(crc_ok); }
 #endif /* CONFIG_BT_CTLR_LE_ENC */
 
+static void ar_rx_end(bool crc_ok, const uint8_t *pkt);
+
 static void op_commit(void)
 {
 	enum trx trx = r.armed;
@@ -206,6 +208,7 @@ static void isr_radio_evt(const struct bsr_evt *evt)
 		if (trx == TRX_RX) {
 			r.crc_valid = (evt->status == BSR_STATUS_OK);
 			ccm_rx_end(r.crc_valid);
+			ar_rx_end(r.crc_valid, r.pkt_rx);
 
 			if (r.armed_rssi) {
 				r.rssi = (uint8_t)(-evt->rssi);
@@ -1067,30 +1070,84 @@ void radio_ccm_disable(void)
 }
 #endif /* CONFIG_BT_CTLR_LE_ENC */
 
+/* Address resolution, done in software when a PDU is received, as the nRF
+ * AAR does on the first address of the PDU payload. IRKs are big endian.
+ */
+static struct {
+	const uint8_t (*irk)[16];
+	uint8_t nirk;
+	bool enabled;
+	bool resolved;
+	uint8_t match;
+} ar;
+
+static bool ar_resolve(const uint8_t *addr)
+{
+	uint8_t prand[16] = { 0 };
+	uint8_t hash[16];
+
+	ar.resolved = false;
+	ar.match = 0U;
+
+	/* prand in the 3 most significant bytes of the big endian block */
+	prand[13] = addr[5];
+	prand[14] = addr[4];
+	prand[15] = addr[3];
+
+	for (uint8_t i = 0U; i < ar.nirk; i++) {
+		ecb_encrypt_be(ar.irk[i], prand, hash);
+		if ((hash[15] == addr[0]) && (hash[14] == addr[1]) &&
+		    (hash[13] == addr[2])) {
+			ar.resolved = true;
+			ar.match = i;
+			break;
+		}
+	}
+
+	return ar.resolved;
+}
+
+static void ar_rx_end(bool crc_ok, const uint8_t *pkt)
+{
+	if (!ar.enabled) {
+		return;
+	}
+
+	if (crc_ok && (pkt[1] >= BDADDR_SIZE)) {
+		(void)ar_resolve(&pkt[2]);
+	} else {
+		ar.resolved = false;
+	}
+}
+
 void radio_ar_configure(uint32_t nirk, void *irk, uint8_t flags)
 {
-	ARG_UNUSED(nirk);
-	ARG_UNUSED(irk);
+	/* Only legacy PDUs on 1M PHY, the address is the first in payload */
 	ARG_UNUSED(flags);
+
+	ar.irk = irk;
+	ar.nirk = nirk;
+	ar.enabled = true;
+	ar.resolved = false;
+	ar.match = 0U;
 }
 
 uint32_t radio_ar_match_get(void)
 {
-	return 0U;
+	return ar.match;
 }
 
 void radio_ar_status_reset(void)
 {
+	ar.enabled = false;
 }
 
 uint32_t radio_ar_has_match(void)
 {
-	return 0U;
+	return ar.resolved;
 }
 
 uint8_t radio_ar_resolve(const uint8_t *addr)
 {
-	ARG_UNUSED(addr);
-
-	return 0U;
+	return ar_resolve(addr) ? 1U : 0U;
 }

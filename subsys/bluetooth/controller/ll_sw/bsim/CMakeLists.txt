@@ -29,16 +29,14 @@ if(CONFIG_BT_CONN)
     )
 endif()
 
+# The software AES in ecb.c is also used by the radio HAL for CCM and
+# address resolution.
 zephyr_library_sources(
   hal/bsim/cntr.c
+  hal/bsim/ecb.c
   hal/bsim/radio/radio.c
   hal/bsim/mayfly.c
   hal/bsim/ticker.c
-  )
-
-zephyr_library_sources_ifdef(
-  CONFIG_BT_CTLR_CRYPTO
-  hal/bsim/ecb.c
   )
 
 zephyr_library_include_directories(
