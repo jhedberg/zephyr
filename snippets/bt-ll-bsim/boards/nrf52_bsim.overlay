@@ -1,0 +1,31 @@
+/*
+ * Copyright The Zephyr Project Contributors
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/* The nRF RADIO, RTC0 and SWI4/SWI5 are unused with the BabbleSim LLL, so
+ * reuse their interrupt lines.
+ */
+
+&bt_hci_controller {
+	status = "disabled";
+};
+
+/ {
+	bsim_2g4_radio: bsim-2g4-radio {
+		compatible = "zephyr,bsim-2g4-radio";
+		interrupt-parent = <&nvic>;
+		interrupts = <1 0>, <11 0>, <24 0>, <25 0>;
+		interrupt-names = "radio", "cntr", "swi-lll", "swi-ull-low";
+
+		bt_hci_bsim: bt_hci_bsim {
+			compatible = "zephyr,bt-hci-ll-sw-split";
+			status = "okay";
+		};
+	};
+
+	chosen {
+		zephyr,bt-hci = &bt_hci_bsim;
+	};
+};
