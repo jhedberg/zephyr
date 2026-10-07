@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2023 Nordic Semiconductor ASA
+ * Copyright The Zephyr Project Contributors
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -15,9 +16,7 @@ struct pdu_data_vnd_octet3 {
 	union {
 		uint8_t resv[OCTET3_LEN]; /* unused */
 
-#if !defined(CONFIG_BT_CTLR_DATA_LENGTH_CLEAR)
-		struct pdu_cte_info cte_info; /* BT 5.1 Core spec. CTEInfo storage */
-#endif /* !CONFIG_BT_CTLR_DATA_LENGTH_CLEAR */
+		/* No CTEInfo storage, Direction Finding is not supported */
 	} __packed;
 } __packed;
 

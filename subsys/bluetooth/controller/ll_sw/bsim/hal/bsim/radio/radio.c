@@ -96,6 +96,11 @@ static void op_arm(enum trx trx, uint32_t ready)
 	r.armed = trx;
 	r.armed_ready = ready;
 
+	/* As the nRF timer capture of the radio ready event, only the timer
+	 * started operations are captured, not the tIFS switched ones.
+	 */
+	r.ready = ready;
+
 	/* Commit the operation from the radio ISR, once the caller is done
 	 * setting up packet pointers, timeouts, etc.
 	 */
@@ -112,7 +117,6 @@ static void op_commit(void)
 	}
 
 	r.armed = TRX_NONE;
-	r.ready = r.armed_ready;
 
 	if (trx == TRX_TX) {
 		id = bsr_tx(&r.cfg, r.armed_ready, r.pkt_tx);
@@ -131,6 +135,10 @@ static void op_commit(void)
 		}
 
 		id = bsr_rx(&r.cfg, r.armed_ready, window_us, r.pkt_rx);
+#if defined(RADIO_BSIM_TRACE)
+		printk("RC rx t0 %u ready %u hcto %u(%d) win %u now %u\n", r.tmr_start,
+		       r.armed_ready, r.hcto, r.hcto_set, window_us, bsr_cntr_get());
+#endif
 	}
 
 	/* The LLL always starts the radio in the future */
@@ -198,6 +206,16 @@ static void isr_radio_evt(const struct bsr_evt *evt)
 	}
 
 	r.disabled_in_isr = false;
+
+#if defined(RADIO_BSIM_TRACE)
+	{
+		const uint8_t *p = (trx == TRX_RX) ? r.pkt_rx : r.pkt_tx;
+
+		printk("RT %s st %d ch %u aa %08x aa_end %u end %u hdr %02x %02x %02x %02x %02x\n",
+		       (trx == TRX_RX) ? "rx" : "tx", evt->status, r.cfg.chan, r.cfg.aa,
+		       evt->ts_aa_end, evt->ts_end, p[0], p[1], p[2], p[3], p[4]);
+	}
+#endif
 
 	if (isr_cb) {
 		isr_cb(isr_cb_param);

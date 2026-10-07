@@ -4,11 +4,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#if DT_NODE_HAS_PROP(DT_NODELABEL(hfxo), startup_time_us)
-#define EVENT_OVERHEAD_XTAL_US        DT_PROP(DT_NODELABEL(hfxo), startup_time_us)
-#else
+/* The simulated clocks are always running, keep the nRF52 HFXO start-up time
+ * so that event scheduling behaves as on hardware.
+ */
 #define EVENT_OVERHEAD_XTAL_US        1500
-#endif
 #define EVENT_OVERHEAD_PREEMPT_US     0    /* if <= min, then dynamic preempt */
 #define EVENT_OVERHEAD_PREEMPT_MIN_US 0
 #define EVENT_OVERHEAD_PREEMPT_MAX_US EVENT_OVERHEAD_XTAL_US
