@@ -16,6 +16,7 @@
 
 #include "hal/cpu.h"
 #include "hal/ccm.h"
+#include "hal/ecb.h"
 #include "hal/swi.h"
 #include "hal/radio.h"
 #include "hal/ticker.h"
@@ -107,6 +108,16 @@ static void op_arm(enum trx trx, uint32_t ready)
 	posix_sw_set_pending_IRQ(HAL_RADIO_IRQn);
 }
 
+#if defined(CONFIG_BT_CTLR_LE_ENC)
+static void ccm_tx_commit(void);
+static void ccm_rx_commit(void);
+static void ccm_rx_end(bool crc_ok);
+#else
+static inline void ccm_tx_commit(void) {}
+static inline void ccm_rx_commit(void) {}
+static inline void ccm_rx_end(bool crc_ok) { ARG_UNUSED(crc_ok); }
+#endif /* CONFIG_BT_CTLR_LE_ENC */
+
 static void op_commit(void)
 {
 	enum trx trx = r.armed;
@@ -119,6 +130,7 @@ static void op_commit(void)
 	r.armed = TRX_NONE;
 
 	if (trx == TRX_TX) {
+		ccm_tx_commit();
 		id = bsr_tx(&r.cfg, r.armed_ready, r.pkt_tx);
 	} else {
 		uint32_t window_us = 0U;
@@ -134,6 +146,7 @@ static void op_commit(void)
 			}
 		}
 
+		ccm_rx_commit();
 		id = bsr_rx(&r.cfg, r.armed_ready, window_us, r.pkt_rx);
 #if defined(RADIO_BSIM_TRACE)
 		printk("RC rx t0 %u ready %u hcto %u(%d) win %u now %u\n", r.tmr_start,
@@ -192,6 +205,7 @@ static void isr_radio_evt(const struct bsr_evt *evt)
 
 		if (trx == TRX_RX) {
 			r.crc_valid = (evt->status == BSR_STATUS_OK);
+			ccm_rx_end(r.crc_valid);
 
 			if (r.armed_rssi) {
 				r.rssi = (uint8_t)(-evt->rssi);
@@ -837,36 +851,221 @@ void radio_gpio_pa_lna_disable(void)
 {
 }
 
+#if defined(CONFIG_BT_CTLR_LE_ENC)
+/* Bluetooth LE AES-CCM, done in software when the packet is transmitted or
+ * received, as the nRF CCM peripheral does on the fly.
+ */
+#define CCM_MIC_LEN   4U
+#define CCM_HDR_MASK  0xE3U /* NESN, SN and MD are not authenticated */
+
+static struct {
+	struct ccm *rx_ccm;
+	uint8_t *rx_out;
+	bool rx_done;
+	bool rx_mic_valid;
+
+	struct ccm *tx_ccm;
+	const uint8_t *tx_in;
+} c;
+
+static void ccm_nonce(const struct ccm *ccm, uint8_t nonce[13])
+{
+	sys_put_le32((uint32_t)ccm->counter, &nonce[0]);
+	nonce[4] = ((ccm->counter >> 32) & 0x7FU) | (ccm->direction << 7);
+	memcpy(&nonce[5], ccm->iv, sizeof(ccm->iv));
+}
+
+static void ccm_block_xor(uint8_t *dst, const uint8_t *src, uint8_t len)
+{
+	for (uint8_t i = 0U; i < len; i++) {
+		dst[i] ^= src[i];
+	}
+}
+
+/* Compute the MIC over the clear text payload, and the payload key stream
+ * applied in place (encrypt or decrypt).
+ */
+static void ccm_crypt(const struct ccm *ccm, uint8_t hdr, uint8_t *payload,
+		      uint8_t len, bool encrypt, uint8_t mic[CCM_MIC_LEN])
+{
+	uint8_t nonce[13];
+	uint8_t blk[16];
+	uint8_t x[16];
+	uint8_t s[16];
+
+	ccm_nonce(ccm, nonce);
+
+	if (!encrypt) {
+		/* Decrypt first, the MIC is computed over the clear text */
+		for (uint16_t off = 0U, i = 1U; off < len; off += 16U, i++) {
+			blk[0] = 0x01U;
+			memcpy(&blk[1], nonce, sizeof(nonce));
+			sys_put_be16(i, &blk[14]);
+			ecb_encrypt_be(ccm->key, blk, s);
+			ccm_block_xor(&payload[off], s, MIN(16U, len - off));
+		}
+	}
+
+	/* B0: flags (Adata, M = 4, L = 2), nonce, payload length */
+	blk[0] = 0x49U;
+	memcpy(&blk[1], nonce, sizeof(nonce));
+	sys_put_be16(len, &blk[14]);
+	ecb_encrypt_be(ccm->key, blk, x);
+
+	/* B1: the masked header as additional authenticated data */
+	(void)memset(blk, 0, sizeof(blk));
+	sys_put_be16(1U, &blk[0]);
+	blk[2] = hdr & CCM_HDR_MASK;
+	ccm_block_xor(x, blk, 16U);
+	ecb_encrypt_be(ccm->key, x, x);
+
+	for (uint16_t off = 0U; off < len; off += 16U) {
+		ccm_block_xor(x, &payload[off], MIN(16U, len - off));
+		ecb_encrypt_be(ccm->key, x, x);
+	}
+
+	/* A0 key stream encrypts the MIC */
+	blk[0] = 0x01U;
+	memcpy(&blk[1], nonce, sizeof(nonce));
+	sys_put_be16(0U, &blk[14]);
+	ecb_encrypt_be(ccm->key, blk, s);
+	for (uint8_t i = 0U; i < CCM_MIC_LEN; i++) {
+		mic[i] = x[i] ^ s[i];
+	}
+
+	if (encrypt) {
+		for (uint16_t off = 0U, i = 1U; off < len; off += 16U, i++) {
+			blk[0] = 0x01U;
+			memcpy(&blk[1], nonce, sizeof(nonce));
+			sys_put_be16(i, &blk[14]);
+			ecb_encrypt_be(ccm->key, blk, s);
+			ccm_block_xor(&payload[off], s, MIN(16U, len - off));
+		}
+	}
+}
+
+static void ccm_tx_encrypt(void)
+{
+	struct ccm *ccm = c.tx_ccm;
+	const uint8_t *in = c.tx_in;
+	uint8_t *out = _pkt_scratch;
+	uint8_t len = in[1];
+
+	c.tx_ccm = NULL;
+
+	out[0] = in[0];
+	out[1] = len;
+	memcpy(&out[2], &in[2], len);
+
+	/* Empty PDUs are not encrypted */
+	if (len == 0U) {
+		return;
+	}
+
+	ccm_crypt(ccm, in[0], &out[2], len, true, &out[2 + len]);
+	out[1] = len + CCM_MIC_LEN;
+}
+
+static void ccm_rx_decrypt(void)
+{
+	const uint8_t *in = _pkt_scratch;
+	uint8_t *out = c.rx_out;
+	uint8_t len = in[1];
+	uint8_t mic[CCM_MIC_LEN];
+
+	c.rx_done = true;
+	c.rx_mic_valid = false;
+
+	out[0] = in[0];
+
+	if (len == 0U) {
+		out[1] = 0U;
+		c.rx_mic_valid = true;
+		return;
+	}
+
+	if (len <= CCM_MIC_LEN) {
+		out[1] = 0U;
+		return;
+	}
+
+	len -= CCM_MIC_LEN;
+	out[1] = len;
+	memcpy(&out[2], &in[2], len);
+
+	ccm_crypt(c.rx_ccm, in[0], &out[2], len, false, mic);
+	c.rx_mic_valid = (memcmp(mic, &in[2 + len], CCM_MIC_LEN) == 0);
+}
+
+static void ccm_tx_commit(void)
+{
+	if (c.tx_ccm == NULL) {
+		return;
+	}
+
+	if (r.pkt_tx == _pkt_scratch) {
+		ccm_tx_encrypt();
+	} else {
+		c.tx_ccm = NULL;
+	}
+}
+
+static void ccm_rx_commit(void)
+{
+	if (r.pkt_rx != _pkt_scratch) {
+		c.rx_ccm = NULL;
+	}
+}
+
+static void ccm_rx_end(bool crc_ok)
+{
+	if (c.rx_ccm == NULL) {
+		return;
+	}
+
+	if (crc_ok) {
+		ccm_rx_decrypt();
+	}
+
+	c.rx_ccm = NULL;
+}
+
 void *radio_ccm_rx_pkt_set(struct ccm *ccm, uint8_t phy, void *pkt)
 {
-	/* TODO: Encryption */
-	ARG_UNUSED(ccm);
 	ARG_UNUSED(phy);
 
-	return pkt;
+	c.rx_ccm = ccm;
+	c.rx_out = pkt;
+	c.rx_done = false;
+	c.rx_mic_valid = false;
+
+	return _pkt_scratch;
 }
 
 void *radio_ccm_tx_pkt_set(struct ccm *ccm, void *pkt)
 {
-	/* TODO: Encryption */
-	ARG_UNUSED(ccm);
+	c.tx_ccm = ccm;
+	c.tx_in = pkt;
 
-	return pkt;
+	return _pkt_scratch;
 }
 
 uint32_t radio_ccm_is_done(void)
 {
-	return 1U;
+	return c.rx_done;
 }
 
 uint32_t radio_ccm_mic_is_valid(void)
 {
-	return 1U;
+	return c.rx_mic_valid;
 }
 
 void radio_ccm_disable(void)
 {
+	c.rx_ccm = NULL;
+	c.tx_ccm = NULL;
 }
+#endif /* CONFIG_BT_CTLR_LE_ENC */
 
 void radio_ar_configure(uint32_t nirk, void *irk, uint8_t flags)
 {
