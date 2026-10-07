@@ -10,16 +10,13 @@
 #include <errno.h>
 
 #include <zephyr/toolchain.h>
-
 #include <zephyr/device.h>
-
 #include <zephyr/drivers/entropy.h>
 #include <zephyr/irq.h>
+#include <zephyr/sys/util.h>
 
 #include "hal/swi.h"
-#include "hal/ccm.h"
 #include "hal/cntr.h"
-#include "hal/radio.h"
 #include "hal/ticker.h"
 
 #include "util/mem.h"
@@ -28,36 +25,31 @@
 
 #include "ticker/ticker.h"
 
+#include "pdu_vendor.h"
+#include "pdu.h"
+
 #include "lll.h"
 #include "lll_vendor.h"
 #include "lll_clock.h"
 #include "lll_internal.h"
-#include "lll_prof_internal.h"
+#include "lll_tim_internal.h"
+#include "lll_radio.h"
 
 #include "hal/debug.h"
 
+/* Range of the transmit power of the radio model, in dBm */
+#define TX_PWR_MIN (-40)
+#define TX_PWR_MAX 8
 
-/* Entropy device */
 #if defined(CONFIG_ENTROPY_HAS_DRIVER)
 static const struct device *const dev_entropy = DEVICE_DT_GET(DT_CHOSEN(zephyr_entropy));
 #endif /* CONFIG_ENTROPY_HAS_DRIVER */
-
-static int init_reset(void);
-static void isr_race(void *param);
 
 static void radio_bsim_isr(const void *arg)
 {
 	DEBUG_RADIO_ISR(1);
 
-	if (IS_ENABLED(CONFIG_BT_CTLR_PROFILE_ISR)) {
-		lll_prof_enter_radio();
-	}
-
-	isr_radio();
-
-	if (IS_ENABLED(CONFIG_BT_CTLR_PROFILE_ISR)) {
-		lll_prof_exit_radio();
-	}
+	lll_radio_isr();
 
 	DEBUG_RADIO_ISR(0);
 }
@@ -66,10 +58,6 @@ static void cntr_bsim_isr(const void *arg)
 {
 	DEBUG_TICKER_ISR(1);
 
-	if (IS_ENABLED(CONFIG_BT_CTLR_PROFILE_ISR)) {
-		lll_prof_enter_ull_high();
-	}
-
 	/* The counter interrupt line is shared with the ULL mayflies */
 	if (cntr_cmp_evt_get_clear()) {
 		ticker_trigger(0);
@@ -77,21 +65,9 @@ static void cntr_bsim_isr(const void *arg)
 
 	mayfly_run(TICKER_USER_ID_ULL_HIGH);
 
-	if (IS_ENABLED(CONFIG_BT_CTLR_PROFILE_ISR)) {
-		lll_prof_exit_ull_high();
-	}
-
 #if !defined(CONFIG_BT_CTLR_LOW_LAT) && \
 	(CONFIG_BT_CTLR_ULL_HIGH_PRIO == CONFIG_BT_CTLR_ULL_LOW_PRIO)
-	if (IS_ENABLED(CONFIG_BT_CTLR_PROFILE_ISR)) {
-		lll_prof_enter_ull_low();
-	}
-
 	mayfly_run(TICKER_USER_ID_ULL_LOW);
-
-	if (IS_ENABLED(CONFIG_BT_CTLR_PROFILE_ISR)) {
-		lll_prof_exit_ull_low();
-	}
 #endif
 
 	DEBUG_TICKER_ISR(0);
@@ -101,15 +77,7 @@ static void swi_lll_bsim_isr(const void *arg)
 {
 	DEBUG_RADIO_ISR(1);
 
-	if (IS_ENABLED(CONFIG_BT_CTLR_PROFILE_ISR)) {
-		lll_prof_enter_lll();
-	}
-
 	mayfly_run(TICKER_USER_ID_LLL);
-
-	if (IS_ENABLED(CONFIG_BT_CTLR_PROFILE_ISR)) {
-		lll_prof_exit_lll();
-	}
 
 	DEBUG_RADIO_ISR(0);
 }
@@ -120,15 +88,7 @@ static void swi_ull_low_bsim_isr(const void *arg)
 {
 	DEBUG_TICKER_JOB(1);
 
-	if (IS_ENABLED(CONFIG_BT_CTLR_PROFILE_ISR)) {
-		lll_prof_enter_ull_low();
-	}
-
 	mayfly_run(TICKER_USER_ID_ULL_LOW);
-
-	if (IS_ENABLED(CONFIG_BT_CTLR_PROFILE_ISR)) {
-		lll_prof_exit_ull_low();
-	}
 
 	DEBUG_TICKER_JOB(0);
 }
@@ -139,30 +99,20 @@ int lll_init(void)
 	int err;
 
 #if defined(CONFIG_ENTROPY_HAS_DRIVER)
-	/* Get reference to entropy device */
 	if (!device_is_ready(dev_entropy)) {
 		return -ENODEV;
 	}
 #endif /* CONFIG_ENTROPY_HAS_DRIVER */
 
-	/* Initialise LLL internals */
 	lll_prepare_pipeline_init();
 
-	/* Initialize Clocks */
 	err = lll_clock_init();
 	if (err < 0) {
 		return err;
 	}
 
-	err = init_reset();
-	if (err) {
-		return err;
-	}
-
-	/* Initialize SW IRQ structure */
 	hal_swi_init();
 
-	/* Connect ISRs */
 	IRQ_CONNECT(HAL_RADIO_IRQn, CONFIG_BT_CTLR_LLL_PRIO, radio_bsim_isr, NULL, 0);
 	IRQ_CONNECT(HAL_RTC_IRQn, CONFIG_BT_CTLR_ULL_HIGH_PRIO, cntr_bsim_isr, NULL, 0);
 	IRQ_CONNECT(HAL_SWI_RADIO_IRQ, CONFIG_BT_CTLR_LLL_PRIO, swi_lll_bsim_isr, NULL, 0);
@@ -171,16 +121,15 @@ int lll_init(void)
 	IRQ_CONNECT(HAL_SWI_JOB_IRQ, CONFIG_BT_CTLR_ULL_LOW_PRIO, swi_ull_low_bsim_isr, NULL, 0);
 #endif
 
-	/* Enable IRQs */
 	irq_enable(HAL_RADIO_IRQn);
 	irq_enable(HAL_RTC_IRQn);
 	irq_enable(HAL_SWI_RADIO_IRQ);
 	if (IS_ENABLED(CONFIG_BT_CTLR_LOW_LAT) ||
-		(CONFIG_BT_CTLR_ULL_HIGH_PRIO != CONFIG_BT_CTLR_ULL_LOW_PRIO)) {
+	    (CONFIG_BT_CTLR_ULL_HIGH_PRIO != CONFIG_BT_CTLR_ULL_LOW_PRIO)) {
 		irq_enable(HAL_SWI_JOB_IRQ);
 	}
 
-	radio_setup();
+	lll_radio_init();
 
 	return 0;
 }
@@ -189,21 +138,24 @@ int lll_deinit(void)
 {
 	int err;
 
-	/* Release clocks */
 	err = lll_clock_deinit();
 	if (err < 0) {
 		return err;
 	}
 
-	/* Disable IRQs */
 	irq_disable(HAL_RADIO_IRQn);
 	irq_disable(HAL_RTC_IRQn);
 	irq_disable(HAL_SWI_RADIO_IRQ);
 	if (IS_ENABLED(CONFIG_BT_CTLR_LOW_LAT) ||
-		(CONFIG_BT_CTLR_ULL_HIGH_PRIO != CONFIG_BT_CTLR_ULL_LOW_PRIO)) {
+	    (CONFIG_BT_CTLR_ULL_HIGH_PRIO != CONFIG_BT_CTLR_ULL_LOW_PRIO)) {
 		irq_disable(HAL_SWI_JOB_IRQ);
 	}
 
+	return 0;
+}
+
+int lll_reset(void)
+{
 	return 0;
 }
 
@@ -235,253 +187,100 @@ int lll_rand_isr_get(void *buf, size_t len)
 	return lll_csrand_isr_get(buf, len);
 }
 
-int lll_reset(void)
+/* The radio model has no ramp up: a radio operation starts with its first
+ * bit on air at the requested time.
+ */
+uint32_t lll_radio_tx_ready_delay_get(uint8_t phy, uint8_t flags)
 {
-	int err;
-
-	err = init_reset();
-	if (err) {
-		return err;
-	}
-
-	return 0;
+	return 0U;
 }
 
-int lll_is_abort_cb(void *next, void *curr, lll_prepare_cb_t *resume_cb)
+uint32_t lll_radio_rx_ready_delay_get(uint8_t phy, uint8_t flags)
 {
-	return -ECANCELED;
+	return 0U;
 }
 
-void lll_abort_cb(struct lll_prepare_param *prepare_param, void *param)
+int8_t lll_radio_tx_pwr_min_get(void)
 {
-	int err;
-
-	/* NOTE: This is not a prepare being cancelled */
-	if (!prepare_param) {
-		/* Perform event abort here.
-		 * After event has been cleanly aborted, clean up resources
-		 * and dispatch event done.
-		 */
-		radio_isr_set(lll_isr_done, param);
-		radio_disable();
-		return;
-	}
-
-	/* NOTE: Else clean the top half preparations of the aborted event
-	 * currently in preparation pipeline.
-	 */
-	err = lll_hfclock_off();
-	LL_ASSERT_ERR(err >= 0);
-
-	lll_done(param);
+	return TX_PWR_MIN;
 }
 
-uint32_t lll_event_offset_get(struct ull_hdr *ull)
+int8_t lll_radio_tx_pwr_max_get(void)
 {
-	return HAL_TICKER_US_TO_TICKS(EVENT_OVERHEAD_XTAL_US);
+	return TX_PWR_MAX;
 }
 
-uint32_t lll_preempt_calc(struct ull_hdr *ull, uint8_t ticker_id,
-		       uint32_t ticks_at_event)
+int8_t lll_radio_tx_pwr_floor(int8_t tx_pwr_lvl)
 {
-	uint32_t ticks_now;
+	return CLAMP(tx_pwr_lvl, TX_PWR_MIN, TX_PWR_MAX);
+}
+
+uint32_t lll_event_start_get(const struct lll_prepare_param *p, uint32_t *ticks_ref)
+{
+	uint32_t remainder = p->remainder;
+	uint32_t ticks;
+
+	ticks = p->ticks_at_expire + HAL_TICKER_US_TO_TICKS(EVENT_OVERHEAD_XTAL_US) +
+		HAL_TICKER_US_TO_TICKS(EVENT_OVERHEAD_START_US);
+
+	/* Positive remainder in microseconds after the tick */
+	hal_ticker_remove_jitter(&ticks, &remainder);
+
+	*ticks_ref = ticks & HAL_TICKER_CNTR_MASK;
+
+	return HAL_TICKER_TICKS_TO_US(*ticks_ref) + remainder;
+}
+
+uint32_t lll_preempt_calc(const struct lll_prepare_param *p)
+{
+	uint32_t ticks_at_event;
 	uint32_t diff;
 
-	ticks_now = ticker_ticks_now_get();
-	diff = ticker_ticks_diff_get(ticks_now, ticks_at_event);
+	ticks_at_event = p->ticks_at_expire + HAL_TICKER_US_TO_TICKS(EVENT_OVERHEAD_XTAL_US);
+	diff = ticker_ticks_diff_get(ticker_ticks_now_get(), ticks_at_event);
 	if (diff & BIT(HAL_TICKER_CNTR_MSBIT)) {
-		return 0;
+		return 0U;
 	}
 
-	diff += HAL_TICKER_CNTR_CMP_OFFSET_MIN +
-		HAL_TICKER_US_TO_TICKS_CEIL(HAL_RADIO_ISR_LATENCY_MAX_US);
+	/* The event start must be after now for the radio to accept it */
+	diff += HAL_TICKER_CNTR_CMP_OFFSET_MIN;
 	if (diff > HAL_TICKER_US_TO_TICKS(EVENT_OVERHEAD_START_US)) {
-		/* TODO: for Low Latency Feature with Advanced XTAL feature.
-		 * 1. Release retained HF clock.
-		 * 2. Advance the radio event to accommodate normal prepare
-		 *    duration.
-		 * 3. Increase the preempt to start ticks for future events.
-		 */
 		return diff;
 	}
 
 	return 0U;
 }
 
-void lll_chan_set(uint32_t chan)
+void lll_resume_param_set(struct lll_prepare_param *p)
 {
-	switch (chan) {
-	case 37:
-		radio_freq_chan_set(2);
-		break;
-
-	case 38:
-		radio_freq_chan_set(26);
-		break;
-
-	case 39:
-		radio_freq_chan_set(80);
-		break;
-
-	default:
-		if (chan < 11) {
-			radio_freq_chan_set(4 + (chan * 2U));
-		} else if (chan < 40) {
-			radio_freq_chan_set(28 + ((chan - 11) * 2U));
-		} else {
-			LL_ASSERT_DBG(0);
-		}
-		break;
-	}
-
-	radio_whiten_iv_set(chan);
+	p->ticks_at_expire = ticker_ticks_now_get() -
+			     HAL_TICKER_US_TO_TICKS(EVENT_OVERHEAD_XTAL_US);
+	p->remainder = 0U;
+	p->lazy = 0U;
 }
 
-
-uint32_t lll_radio_is_idle(void)
+static void isr_event_abort(const struct bsr_evt *evt, void *param)
 {
-	return radio_is_idle();
-}
+	ARG_UNUSED(evt);
 
-uint32_t lll_radio_tx_ready_delay_get(uint8_t phy, uint8_t flags)
-{
-	return radio_tx_ready_delay_get(phy, flags);
-}
-
-uint32_t lll_radio_rx_ready_delay_get(uint8_t phy, uint8_t flags)
-{
-	return radio_rx_ready_delay_get(phy, flags);
-}
-
-int8_t lll_radio_tx_pwr_min_get(void)
-{
-	return radio_tx_power_min_get();
-}
-
-int8_t lll_radio_tx_pwr_max_get(void)
-{
-	return radio_tx_power_max_get();
-}
-
-int8_t lll_radio_tx_pwr_floor(int8_t tx_pwr_lvl)
-{
-	return radio_tx_power_floor(tx_pwr_lvl);
-}
-
-void lll_isr_tx_status_reset(void)
-{
-	radio_status_reset();
-	radio_tmr_status_reset();
-
-	if (IS_ENABLED(HAL_RADIO_GPIO_HAVE_PA_PIN) ||
-	    IS_ENABLED(HAL_RADIO_GPIO_HAVE_LNA_PIN)) {
-		radio_gpio_pa_lna_disable();
-	}
-}
-
-void lll_isr_rx_status_reset(void)
-{
-	radio_status_reset();
-	radio_tmr_status_reset();
-	radio_rssi_status_reset();
-
-	if (IS_ENABLED(HAL_RADIO_GPIO_HAVE_PA_PIN) ||
-	    IS_ENABLED(HAL_RADIO_GPIO_HAVE_LNA_PIN)) {
-		radio_gpio_pa_lna_disable();
-	}
-}
-
-void lll_isr_tx_sub_status_reset(void)
-{
-	radio_status_reset();
-	radio_tmr_tx_status_reset();
-
-	if (IS_ENABLED(HAL_RADIO_GPIO_HAVE_PA_PIN) ||
-	    IS_ENABLED(HAL_RADIO_GPIO_HAVE_LNA_PIN)) {
-		radio_gpio_pa_lna_disable();
-	}
-}
-
-void lll_isr_rx_sub_status_reset(void)
-{
-	radio_status_reset();
-	radio_tmr_rx_status_reset();
-
-	if (IS_ENABLED(HAL_RADIO_GPIO_HAVE_PA_PIN) ||
-	    IS_ENABLED(HAL_RADIO_GPIO_HAVE_LNA_PIN)) {
-		radio_gpio_pa_lna_disable();
-	}
-}
-
-void lll_isr_status_reset(void)
-{
-	radio_status_reset();
-	radio_tmr_status_reset();
-	radio_filter_status_reset();
-	if (IS_ENABLED(CONFIG_BT_CTLR_PRIVACY)) {
-		radio_ar_status_reset();
-	}
-	radio_rssi_status_reset();
-
-	if (IS_ENABLED(HAL_RADIO_GPIO_HAVE_PA_PIN) ||
-	    IS_ENABLED(HAL_RADIO_GPIO_HAVE_LNA_PIN)) {
-		radio_gpio_pa_lna_disable();
-	}
-}
-
-inline void lll_isr_abort(void *param)
-{
-	lll_isr_status_reset();
 	lll_isr_cleanup(param);
 }
 
-void lll_isr_done(void *param)
+void lll_event_abort(void *param)
 {
-	lll_isr_abort(param);
+	lll_radio_stop(isr_event_abort, param);
 }
 
 void lll_isr_cleanup(void *param)
 {
 	int err;
 
-	radio_isr_set(isr_race, param);
-	if (!radio_is_idle()) {
-		radio_disable();
-	}
+	ARG_UNUSED(param);
 
-	radio_tmr_stop();
-	radio_stop();
+	lll_radio_abort();
 
 	err = lll_hfclock_off();
 	LL_ASSERT_ERR(err >= 0);
 
 	lll_done(NULL);
-}
-
-void lll_isr_early_abort(void *param)
-{
-	int err;
-
-	radio_status_reset();
-
-	radio_isr_set(isr_race, param);
-	if (!radio_is_idle()) {
-		radio_disable();
-	}
-
-	err = lll_hfclock_off();
-	LL_ASSERT_ERR(err >= 0);
-
-	lll_done(NULL);
-}
-
-static int init_reset(void)
-{
-	return 0;
-}
-
-static void isr_race(void *param)
-{
-	/* NOTE: lll_disable could have a race with ... */
-	radio_status_reset();
 }

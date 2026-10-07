@@ -6,11 +6,14 @@ zephyr_library_link_libraries(subsys__bluetooth)
 zephyr_library_sources(
   lll/lll.c
   lll/lll_clock.c
+  lll/lll_radio.c
+  lll/lll_addr.c
   ../lll_prepare_pipeline.c
   )
 zephyr_library_sources_ifdef(
   CONFIG_BT_BROADCASTER
   lll/lll_adv.c
+  lll/lll_adv_pdu.c
   )
 zephyr_library_sources_ifdef(
   CONFIG_BT_OBSERVER
@@ -30,16 +33,15 @@ if(CONFIG_BT_CONN)
     )
 endif()
 zephyr_library_sources_ifdef(
-  CONFIG_BT_CTLR_PROFILE_ISR
-  lll/lll_prof.c
+  CONFIG_BT_CTLR_LE_ENC
+  lll/lll_ccm.c
   )
 
-# The software AES in ecb.c is also used by the radio HAL for CCM and
-# address resolution.
+# The software AES in ecb.c is also used by the LLL for CCM and address
+# resolution.
 zephyr_library_sources(
   hal/bsim/cntr.c
   hal/bsim/ecb.c
-  hal/bsim/radio/radio.c
   hal/bsim/mayfly.c
   hal/bsim/ticker.c
   )
