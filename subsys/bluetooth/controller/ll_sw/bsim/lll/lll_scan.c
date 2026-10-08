@@ -36,7 +36,9 @@
 #include "lll_clock.h"
 #include "lll_df_types.h"
 #include "lll_scan.h"
+#include "lll_conn.h"
 #include "lll_filter.h"
+#include "lll_sched.h"
 
 #include "lll_internal.h"
 #include "lll_tim_internal.h"
@@ -200,6 +202,20 @@ static void isr_done_cleanup(const struct bsr_evt *e, void *param)
 	}
 #endif /* CONFIG_BT_CTLR_SCAN_INDICATION */
 
+	/* Tail chain the LLL disable of any scan event in the pipeline if the
+	 * scan role is to be stopped, on connection setup.
+	 */
+	if (lll->is_stop != 0U) {
+		static memq_link_t link;
+		static struct mayfly mfy = { 0, 0, &link, NULL, lll_disable };
+		uint32_t ret;
+
+		mfy.param = param;
+
+		ret = mayfly_enqueue(TICKER_USER_ID_LLL, TICKER_USER_ID_LLL, 1U, &mfy);
+		LL_ASSERT_ERR(ret == 0U);
+	}
+
 	lll_isr_cleanup(param);
 }
 
@@ -299,6 +315,113 @@ static bool adv_ind_len_check(const struct pdu_adv *pdu)
 	       (pdu->len <= sizeof(struct pdu_adv_adv_ind));
 }
 
+#if defined(CONFIG_BT_CENTRAL)
+static bool init_pdu_check(const struct lll_scan *lll, const struct pdu_adv *pdu)
+{
+	if (((lll->filter_policy & SCAN_FP_FILTER) == 0U) &&
+	    !lll_scan_adva_check(lll, pdu->tx_addr, pdu->adv_ind.addr, FILTER_IDX_NONE)) {
+		return false;
+	}
+
+	if (pdu->type == PDU_ADV_TYPE_ADV_IND) {
+		return adv_ind_len_check(pdu);
+	}
+
+	return (pdu->type == PDU_ADV_TYPE_DIRECT_IND) &&
+	       (pdu->len == sizeof(struct pdu_adv_direct_ind)) &&
+	       lll_scan_tgta_check(lll, true, pdu->rx_addr, pdu->direct_ind.tgt_addr,
+				   FILTER_IDX_NONE, NULL);
+}
+
+static int isr_rx_init(struct lll_scan *lll, const struct bsr_evt *e, struct pdu_adv *pdu_adv_rx)
+{
+	struct node_rx_ftr *ftr;
+	struct node_rx_pdu *rx;
+	struct pdu_adv *pdu_tx;
+	uint32_t conn_space_us;
+	struct ull_hdr *ull;
+	uint32_t pdu_end_us;
+	uint8_t init_tx_addr;
+	uint8_t *init_addr;
+	uint8_t chan_sel;
+
+	if (IS_ENABLED(CONFIG_BT_CTLR_CHAN_SEL_2)) {
+		rx = ull_pdu_rx_alloc_peek(4);
+	} else {
+		rx = ull_pdu_rx_alloc_peek(3);
+	}
+
+	if (rx == NULL) {
+		return -ENOBUFS;
+	}
+
+	/* The CONNECT_IND must be sent within the scan event */
+	pdu_end_us = e->ts_end - HAL_TICKER_TICKS_TO_US(evt.ticks_ref);
+	if (lll->ticks_window == 0U) {
+		uint32_t scan_interval_us;
+
+		scan_interval_us = lll->interval * SCAN_INT_UNIT_US;
+		pdu_end_us %= scan_interval_us;
+	}
+	ull = HDR_LLL2ULL(lll);
+	if (pdu_end_us > (HAL_TICKER_TICKS_TO_US(ull->ticks_slot) - EVENT_IFS_US -
+			  PDU_AC_MAX_US(sizeof(struct pdu_adv_connect_ind), PHY_1M) -
+			  EVENT_OVERHEAD_START_US - EVENT_TICKER_RES_MARGIN_US)) {
+		return -ETIME;
+	}
+
+	init_tx_addr = lll->init_addr_type;
+	init_addr = lll->init_addr;
+
+	pdu_tx = &evt.pdu_tx;
+	lll_scan_prepare_connect_req(lll, pdu_tx, PHY_LEGACY,
+				     e->ts_end - HAL_TICKER_TICKS_TO_US(evt.ticks_ref),
+				     lll->conn_win_offset_us, pdu_adv_rx->tx_addr,
+				     pdu_adv_rx->adv_ind.addr, init_tx_addr, init_addr,
+				     &conn_space_us);
+
+	/* The end of the CONNECT_IND closes the event */
+	lll_radio_tx(&evt.cfg, e->ts_end + EVENT_IFS_US, pdu_tx, isr_done_cleanup, lll);
+
+#if defined(CONFIG_BT_CTLR_CONN_RSSI)
+	lll->conn->rssi_latest = lll_rssi_get(e->rssi);
+#endif /* CONFIG_BT_CTLR_CONN_RSSI */
+
+	/* Stop further connection initiation */
+	lll->conn->central.initiated = 1U;
+
+	/* Stop further initiating events */
+	lll->is_stop = 1U;
+
+	rx = ull_pdu_rx_alloc();
+
+	rx->hdr.type = NODE_RX_TYPE_CONNECTION;
+	rx->hdr.handle = LLL_HANDLE_INVALID;
+
+	/* Give the CONNECT_IND sent to the ULL in place of the received PDU,
+	 * with the channel selection bit of the received PDU.
+	 */
+	chan_sel = pdu_adv_rx->chan_sel;
+	(void)memcpy(rx->pdu, pdu_tx,
+		     offsetof(struct pdu_adv, connect_ind) + sizeof(struct pdu_adv_connect_ind));
+	pdu_adv_rx = (void *)rx->pdu;
+	pdu_adv_rx->chan_sel = chan_sel;
+
+	ftr = &rx->rx_ftr;
+	ftr->param = lll;
+	ftr->ticks_anchor = evt.ticks_ref;
+	ftr->radio_end_us = conn_space_us;
+
+	if (IS_ENABLED(CONFIG_BT_CTLR_CHAN_SEL_2)) {
+		ftr->extra = ull_pdu_rx_alloc();
+	}
+
+	ull_rx_put_sched(rx->hdr.link, rx);
+
+	return 0;
+}
+#endif /* CONFIG_BT_CENTRAL */
+
 static bool scan_req_pdu_check(const struct lll_scan *lll, const struct pdu_adv *pdu)
 {
 	return ((pdu->type == PDU_ADV_TYPE_ADV_IND) || (pdu->type == PDU_ADV_TYPE_SCAN_IND)) &&
@@ -354,6 +477,16 @@ static int isr_rx_pdu(struct lll_scan *lll, const struct bsr_evt *e, struct pdu_
 {
 	bool dir_report = false;
 	int err;
+
+#if defined(CONFIG_BT_CENTRAL)
+	if (lll->conn != NULL) {
+		if ((lll->conn->central.cancelled != 0U) || !init_pdu_check(lll, pdu_adv_rx)) {
+			return -EINVAL;
+		}
+
+		return isr_rx_init(lll, e, pdu_adv_rx);
+	}
+#endif /* CONFIG_BT_CENTRAL */
 
 	/* A PDU that the backoff holds the request for is only reported */
 	if (scan_req_pdu_check(lll, pdu_adv_rx) && backoff_is_req()) {
@@ -421,6 +554,19 @@ static int common_prepare_cb(struct lll_prepare_param *p, bool is_resume)
 
 	DEBUG_RADIO_START_O(1);
 
+#if defined(CONFIG_BT_CENTRAL)
+	/* Not started if stopped on connection establishment race between
+	 * LLL and ULL.
+	 */
+	if (unlikely((lll->is_stop != 0U) ||
+		     ((lll->conn != NULL) && ((lll->conn->central.initiated != 0U) ||
+					      (lll->conn->central.cancelled != 0U))))) {
+		lll_event_abort(lll);
+
+		return 0;
+	}
+#endif /* CONFIG_BT_CENTRAL */
+
 	overhead = lll_preempt_calc(p);
 	if (overhead != 0U) {
 		LL_ASSERT_OVERHEAD(overhead);
@@ -462,6 +608,30 @@ static int common_prepare_cb(struct lll_prepare_param *p, bool is_resume)
 		LL_ASSERT_ERR((ret == TICKER_STATUS_SUCCESS) || (ret == TICKER_STATUS_BUSY));
 	}
 
+#if defined(CONFIG_BT_CENTRAL) && defined(CONFIG_BT_CTLR_SCHED_ADVANCED)
+	/* Get the offset, from this scan window, of the free time space after
+	 * the other central connections where the first connection event is to
+	 * be placed.
+	 */
+	if (lll->conn != NULL) {
+		static memq_link_t link;
+		static struct mayfly mfy = { 0U, 0U, &link, NULL,
+					     ull_sched_mfy_after_cen_offset_get };
+		struct lll_prepare_param *prepare_param;
+		uint32_t ret;
+
+		prepare_param = &lll->prepare_param;
+		prepare_param->ticks_at_expire = p->ticks_at_expire;
+		prepare_param->remainder = p->remainder;
+		prepare_param->param = lll;
+
+		mfy.param = prepare_param;
+
+		ret = mayfly_enqueue(TICKER_USER_ID_LLL, TICKER_USER_ID_ULL_LOW, 1U, &mfy);
+		LL_ASSERT_ERR(ret == 0U);
+	}
+#endif /* CONFIG_BT_CENTRAL && CONFIG_BT_CTLR_SCHED_ADVANCED */
+
 	err = lll_prepare_done(lll);
 	LL_ASSERT_ERR(err == 0);
 
@@ -485,6 +655,7 @@ static int resume_prepare_cb(struct lll_prepare_param *p)
 static void isr_window(const struct bsr_evt *e, void *param)
 {
 	struct lll_scan *lll = param;
+	uint32_t ticks_ref_prev;
 	uint32_t start;
 
 	ARG_UNUSED(e);
@@ -495,8 +666,23 @@ static void isr_window(const struct bsr_evt *e, void *param)
 	}
 
 	/* The new window is the reference of the times reported to the ULL */
+	ticks_ref_prev = evt.ticks_ref;
 	start = lll_radio_now() + 1U;
 	evt.ticks_ref = start;
+
+#if defined(CONFIG_BT_CENTRAL) && defined(CONFIG_BT_CTLR_SCHED_ADVANCED)
+	if ((lll->conn != NULL) && (lll->conn_win_offset_us != 0U)) {
+		/* Keep the offset of the free time space for the first
+		 * connection event relative to the new reference. Underflow
+		 * is accepted, the offset is moved to the future by
+		 * connection intervals when establishing the connection.
+		 */
+		lll->conn_win_offset_us -= HAL_TICKER_TICKS_TO_US(
+			ticker_ticks_diff_get(evt.ticks_ref, ticks_ref_prev));
+	}
+#else /* !CONFIG_BT_CENTRAL || !CONFIG_BT_CTLR_SCHED_ADVANCED */
+	ARG_UNUSED(ticks_ref_prev);
+#endif /* !CONFIG_BT_CENTRAL || !CONFIG_BT_CTLR_SCHED_ADVANCED */
 
 	lll->state = 0U;
 	rx(lll, start);
@@ -505,6 +691,17 @@ static void isr_window(const struct bsr_evt *e, void *param)
 static int is_abort_cb(void *next, void *curr, lll_prepare_cb_t *resume_cb)
 {
 	struct lll_scan *lll = curr;
+
+#if defined(CONFIG_BT_CENTRAL)
+	/* Irrespective of same state/role (initiator radio event) or different
+	 * state/role (example, advertising radio event) that overlaps the
+	 * initiator, if a CONNECT_IND PDU has been enqueued for transmission
+	 * then initiator shall not abort.
+	 */
+	if ((lll->conn != NULL) && (lll->conn->central.initiated != 0U)) {
+		return 0;
+	}
+#endif /* CONFIG_BT_CENTRAL */
 
 	if (next != curr) {
 		/* Put back to resume state for continuous scanning */
@@ -535,6 +732,15 @@ static void abort_cb(struct lll_prepare_param *prepare_param, void *param)
 
 	/* An event in progress rather than one in the prepare pipeline */
 	if (prepare_param == NULL) {
+#if defined(CONFIG_BT_CENTRAL)
+		struct lll_scan *lll = param;
+
+		/* The end of the CONNECT_IND being sent closes the event */
+		if ((lll->conn != NULL) && (lll->conn->central.initiated != 0U)) {
+			return;
+		}
+#endif /* CONFIG_BT_CENTRAL */
+
 		/* The event is done once the radio has been stopped */
 		lll_radio_stop(isr_done_cleanup, param);
 
