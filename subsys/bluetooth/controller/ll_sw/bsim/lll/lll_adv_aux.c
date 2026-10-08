@@ -35,6 +35,7 @@
 #include "hal/ticker.h"
 
 #include "util/util.h"
+#include "util/mem.h"
 #include "util/memq.h"
 #include "util/dbuf.h"
 
