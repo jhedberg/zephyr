@@ -162,6 +162,26 @@ The 64 bit version, ``native_sim/native/64``, compiles your code targeting the
 LP64 ABI (x86-64 in x86 systems), where pointers and longs are 64 bits.
 You can use this target if you cannot compile or run 32 bit binaries.
 
+.. _native_sim_bsim:
+
+BabbleSim version
+=================
+
+The ``native_sim/native/bsim`` target is a 32 bit native_sim which runs in a
+:ref:`BabbleSim<bsim>` simulation, so that Bluetooth LE applications and the
+bsim tests can run without a model of a vendor's SoC. It talks over the
+simulated 2.4GHz channel through the packet level radio model of the BabbleSim
+boards, which selects the BabbleSim LLL of the Zephyr Bluetooth LE Controller,
+and it can share a simulation with :ref:`nrf52_bsim<nrf52_bsim>` devices.
+
+Like the other BabbleSim boards, it needs BabbleSim to build and to run, and it
+takes the BabbleSim command line options, for example ``-s`` and ``-d``.
+
+Two defaults differ from native_sim, as the bsim tests expect those of the other
+BabbleSim boards. The kernel ticks every 100 µs rather than every 10 ms, and each
+device keeps its flash in RAM unless it is given a file with ``--flash``, since
+all the devices of a simulation run in the same folder.
+
 .. _native_sim_Clib_choice:
 
 C library choice

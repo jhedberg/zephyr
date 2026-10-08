@@ -33,3 +33,15 @@ variants:
       default: true
   native_sim/native/64:
     name: Native Simulation port - 64-bit variant
+  native_sim/native/bsim:
+    name: Native Simulation port - BabbleSim variant
+    env:
+      - BSIM_OUT_PATH
+    supported:
+      - bsim
+      - counter
+      - gpio
+    testing:
+      ignore_tags:
+        - modem
+        - bsim_skip_CI
