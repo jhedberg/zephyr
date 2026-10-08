@@ -26,8 +26,7 @@
 #include "nsi_tasks.h"
 #include "nsi_main.h"
 #include "nsi_cpu_ctrl.h"
-#include "NRF_HWLowL.h"
-#include "NHW_misc.h"
+#include "bsim_board_if.h"
 
 static bs_args_struct_t *args_struct;
 /* Direct use of this global is deprecated, use bsim_args_get_global_device_nbr() instead */
@@ -74,7 +73,7 @@ static void print_mcus_info(char *argv, int offset)
 	bs_trace_raw(0, "-------------------------------\n");
 	for (int i = 0; i < NSI_N_CPUS; i++) {
 		bs_trace_raw(0, "CPU %2i, %12s,    %i\n",
-			     i, nhw_get_core_name(i), nsi_cpu_get_auto_start(i));
+			     i, bsim_board_cpu_name_get(i), nsi_cpu_get_auto_start(i));
 	}
 }
 
