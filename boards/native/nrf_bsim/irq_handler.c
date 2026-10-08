@@ -19,6 +19,7 @@
 #include "bs_tracing.h"
 #include <zephyr/tracing/tracing.h>
 #include "bstests.h"
+#include "nsi_cpu_if.h"
 
 static bool CPU_will_be_awaken_from_WFE;
 
@@ -164,6 +165,14 @@ void posix_irq_handler_im_from_sw(void)
 		}
 		posix_irq_handler();
 	}
+}
+
+#define nsif_cpun_irq_raised_from_sw _CONCAT(_CONCAT(nsif_cpu, CONFIG_NATIVE_SIMULATOR_MCU_N),\
+					     _irq_raised_from_sw)
+
+NATIVE_SIMULATOR_IF void nsif_cpun_irq_raised_from_sw(void)
+{
+	posix_irq_handler_im_from_sw();
 }
 
 /**

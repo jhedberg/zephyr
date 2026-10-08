@@ -15,7 +15,7 @@
 #include "nsi_main.h"
 #include "nsi_cpu_ctrl.h"
 
-static const char exe_name[] = "nrf_bsim options:";
+static const char exe_name[] = CONFIG_BOARD " options:";
 
 static char *testid;
 static bool cpu_autostart;

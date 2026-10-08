@@ -14,8 +14,7 @@
 #include "bs_tracing.h"
 #include "nsi_tasks.h"
 #include "nsi_hws_models_if.h"
-#include "NRF_HWLowL.h"
-#include "xo_if.h"
+#include "bsim_board_if.h"
 #include "bsim_args_runner.h"
 
 /* By default every second we will inform the Phy simulator about our timing */
@@ -103,7 +102,7 @@ static void cmd_start_of_found(char *argv, int offset)
 		bs_trace_error_line("start offset (%lf) cannot be smaller than 0\n", tmp_start_of);
 	}
 	sync_args.start_offset = tmp_start_of;
-	xo_model_set_toffset(sync_args.start_offset);
+	bsim_board_start_offset_set(sync_args.start_offset);
 }
 
 static void cmd_no_delay_init_found(char *argv, int offset)
