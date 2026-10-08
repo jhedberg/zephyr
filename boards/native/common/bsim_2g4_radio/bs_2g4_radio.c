@@ -130,35 +130,45 @@ static void radio_timer_update(void)
 	nsi_hws_find_next_event();
 }
 
-static uint32_t rev_24(uint32_t in)
+static uint8_t rev_8(uint8_t in)
 {
-	uint32_t out = 0U;
+	in = ((in & 0xF0U) >> 4) | ((in & 0x0FU) << 4);
+	in = ((in & 0xCCU) >> 2) | ((in & 0x33U) << 2);
+	in = ((in & 0xAAU) >> 1) | ((in & 0x55U) << 1);
 
-	for (int i = 0; i < 24; i++) {
-		if (in & (1U << i)) {
-			out |= 1U << (23 - i);
-		}
-	}
-
-	return out;
+	return in;
 }
 
-/* Bluetooth LE CRC24 (Core spec Vol 6, Part B, 3.1.1), as transmitted */
+static uint32_t rev_24(uint32_t in)
+{
+	return ((uint32_t)rev_8(in) << 16) | ((uint32_t)rev_8(in >> 8) << 8) | rev_8(in >> 16);
+}
+
+/* Bluetooth LE CRC24 (Core spec Vol 6, Part B, 3.1.1), as transmitted. The
+ * shift register is processed LSB first, so the polynomial (0xDA6000) and the
+ * initial value are bit reversed, and the CRC is computed a byte at a time.
+ */
+static uint32_t crc_table[256];
+
+static void crc_table_init(void)
+{
+	for (uint32_t i = 0U; i < 256U; i++) {
+		uint32_t crc = i;
+
+		for (int bit = 0; bit < 8; bit++) {
+			crc = (crc & 1U) ? ((crc >> 1) ^ 0xDA6000U) : (crc >> 1);
+		}
+
+		crc_table[i] = crc;
+	}
+}
+
 static uint32_t ble_crc24(const uint8_t *data, size_t len, uint32_t crc_init)
 {
 	uint32_t crc = rev_24(crc_init & 0xFFFFFFU);
 
 	while (len--) {
-		uint8_t byte = *data++;
-
-		for (int i = 0; i < 8; i++) {
-			if ((crc ^ byte) & 1U) {
-				crc = (crc >> 1) ^ 0xDA6000U;
-			} else {
-				crc >>= 1;
-			}
-			byte >>= 1;
-		}
+		crc = (crc >> 8) ^ crc_table[(crc ^ *data++) & 0xFFU];
 	}
 
 	return crc;
@@ -599,6 +609,8 @@ NSI_HW_EVENT(timer_cntr, cntr_timer_triggered, 50);
 void bsr_init(unsigned int radio_irq, unsigned int cntr_irq)
 {
 	memset(&bsr, 0, sizeof(bsr));
+
+	crc_table_init();
 
 	bsr.radio_irq = radio_irq;
 	bsr.cntr_irq = cntr_irq;
