@@ -740,7 +740,8 @@ static int isr_rx_pdu(struct lll_conn *lll, struct pdu_data *pdu_rx, struct pdu_
 			if (evt.rx_enc) {
 				bool mic_ok;
 
-				mic_ok = lll_ccm_decrypt(&lll->ccm_rx, pdu_rx, pdu_node);
+				mic_ok = lll_ccm_decrypt(&lll->ccm_rx, LLL_CCM_HDR_MASK_ACL, pdu_rx,
+							 pdu_node);
 
 				if (!mic_ok && (lll->ccm_rx.counter == 0U) &&
 				    (pdu_rx->ll_id == PDU_DATA_LLID_CTRL) &&
@@ -839,7 +840,7 @@ static void tx(struct lll_conn *lll, uint32_t at, struct pdu_data *pdu, lll_radi
 
 #if defined(CONFIG_BT_CTLR_LE_ENC)
 	if (lll->enc_tx) {
-		lll_ccm_encrypt(&lll->ccm_tx, pdu, (void *)pdu_enc_tx);
+		lll_ccm_encrypt(&lll->ccm_tx, LLL_CCM_HDR_MASK_ACL, pdu, pdu_enc_tx);
 		pdu = (void *)pdu_enc_tx;
 	}
 #endif /* CONFIG_BT_CTLR_LE_ENC */

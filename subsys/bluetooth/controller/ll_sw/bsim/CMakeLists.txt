@@ -23,6 +23,10 @@ if(CONFIG_BT_BROADCASTER)
     CONFIG_BT_CTLR_ADV_PERIODIC
     lll/lll_adv_sync.c
     )
+  zephyr_library_sources_ifdef(
+    CONFIG_BT_CTLR_ADV_ISO
+    lll/lll_adv_iso.c
+    )
 endif()
 if(CONFIG_BT_OBSERVER)
   zephyr_library_sources(
@@ -35,6 +39,10 @@ if(CONFIG_BT_OBSERVER)
   zephyr_library_sources_ifdef(
     CONFIG_BT_CTLR_SYNC_PERIODIC
     lll/lll_sync.c
+    )
+  zephyr_library_sources_ifdef(
+    CONFIG_BT_CTLR_SYNC_ISO
+    lll/lll_sync_iso.c
     )
 endif()
 if(CONFIG_BT_CONN)
@@ -50,10 +58,11 @@ if(CONFIG_BT_CONN)
     lll/lll_central.c
     )
 endif()
-zephyr_library_sources_ifdef(
-  CONFIG_BT_CTLR_LE_ENC
-  lll/lll_ccm.c
-  )
+if(CONFIG_BT_CTLR_LE_ENC OR CONFIG_BT_CTLR_BROADCAST_ISO_ENC)
+  zephyr_library_sources(
+    lll/lll_ccm.c
+    )
+endif()
 
 # The software AES in ecb.c is also used by the LLL for CCM and address
 # resolution.
