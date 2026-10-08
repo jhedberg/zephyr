@@ -13,7 +13,7 @@ zephyr_library_sources(
 zephyr_library_sources_ifdef(
   CONFIG_BT_BROADCASTER
   lll/lll_adv.c
-  lll/lll_adv_pdu.c
+  ../lll_adv_pdu.c
   )
 zephyr_library_sources_ifdef(
   CONFIG_BT_OBSERVER

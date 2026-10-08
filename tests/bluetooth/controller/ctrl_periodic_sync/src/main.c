@@ -35,7 +35,7 @@ DEFINE_FFF_GLOBALS;
 #include "lll_conn_iso.h"
 #include "lll/lll_adv_types.h"
 #include "lll_adv.h"
-#include "lll/lll_adv_pdu.h"
+#include "lll_adv_pdu.h"
 #include "lll_chan.h"
 #include "lll_scan.h"
 #include "lll_sync.h"

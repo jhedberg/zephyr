@@ -89,16 +89,12 @@ static struct {
 
 int lll_adv_init(void)
 {
-	lll_adv_pdu_init_reset();
-
-	return 0;
+	return lll_adv_pdu_init_reset();
 }
 
 int lll_adv_reset(void)
 {
-	lll_adv_pdu_init_reset();
-
-	return 0;
+	return lll_adv_pdu_init_reset();
 }
 
 void lll_adv_prepare(void *param)
