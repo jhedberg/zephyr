@@ -52,6 +52,9 @@ if(CONFIG_BT_CONN)
   zephyr_library_sources_ifdef(CONFIG_BT_CENTRAL
     "lll/lll_central.c"
   )
+  zephyr_library_sources_ifdef(CONFIG_BT_CTLR_CONN_ISO
+    "lll/lll_conn_iso.c"
+  )
 endif()
 
 if(CONFIG_BT_CTLR_LE_ENC OR CONFIG_BT_CTLR_BROADCAST_ISO_ENC)
