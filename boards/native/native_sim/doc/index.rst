@@ -651,7 +651,8 @@ Here are more details on the peripherals that are currently provided with this b
   :kconfig:option:`CONFIG_FLASH_SIMULATOR`.
 
   By default the binary data is located in the file :file:`flash.bin` in the current
-  working directory. The location of this file can be changed through the
+  working directory, or in RAM with :kconfig:option:`CONFIG_FLASH_SIMULATOR_IN_RAM_BY_DEFAULT`.
+  The location of this file can be changed through the
   command line parameter ``--flash``. The flash data will be stored in raw format
   and the file will be truncated to match the size specified in the devicetree
   configuration. If the file does not exist, the driver creates it; otherwise, the existing file is
