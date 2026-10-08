@@ -52,6 +52,7 @@
 #include "lll_adv.h"
 #include "lll_adv_pdu.h"
 #include "lll_adv_aux.h"
+#include "lll_adv_sync.h"
 #include "lll_filter.h"
 
 #include "lll_internal.h"
@@ -217,6 +218,15 @@ static int prepare_cb(struct lll_prepare_param *p)
 
 	/* Next channel index calculation */
 	lll_aux->data_chan_counter++;
+
+#if defined(CONFIG_BT_CTLR_ADV_PERIODIC) && defined(CONFIG_BT_TICKER_EXT_EXPIRE_INFO)
+	/* Offset and event counter of the periodic advertising event that the
+	 * SyncInfo points to.
+	 */
+	if (pdu->adv_ext_ind.ext_hdr_len && pdu->adv_ext_ind.ext_hdr.sync_info) {
+		ull_adv_sync_lll_syncinfo_fill(pdu, lll_aux);
+	}
+#endif /* CONFIG_BT_CTLR_ADV_PERIODIC && CONFIG_BT_TICKER_EXT_EXPIRE_INFO */
 
 	if (lll_preempt_calc(p)) {
 		lll_radio_stop(isr_done, lll_aux);

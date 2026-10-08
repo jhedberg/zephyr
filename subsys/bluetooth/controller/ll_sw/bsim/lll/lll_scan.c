@@ -85,8 +85,8 @@ static int isr_rx_pdu(struct lll_scan *lll, const struct bsr_evt *e, struct pdu_
 		      const struct lll_addr_match *match, uint8_t rl_idx);
 static bool isr_scan_tgta_check(const struct lll_scan *lll, bool init, uint8_t addr_type,
 				const uint8_t *addr, uint8_t rl_idx, bool *dir_report);
-static int isr_rx_scan_report(struct lll_scan *lll, const struct bsr_evt *e, uint8_t irkmatch_ok,
-			      uint8_t rl_idx, bool dir_report);
+static int isr_rx_scan_report(struct lll_scan *lll, const struct bsr_evt *e,
+			      const struct lll_addr_match *match, uint8_t rl_idx, bool dir_report);
 
 /* State of the current scan event */
 static struct {
@@ -159,8 +159,8 @@ uint8_t lll_scan_rl_idx_get(const struct lll_scan *lll, const struct lll_addr_ma
 #endif /* !CONFIG_BT_CTLR_PRIVACY */
 }
 
-bool lll_scan_isr_rx_check(const struct lll_scan *lll, uint8_t irkmatch_ok, uint8_t devmatch_ok,
-			   uint8_t rl_idx)
+static bool isr_rx_check(const struct lll_scan *lll, uint8_t irkmatch_ok, uint8_t devmatch_ok,
+			 uint8_t rl_idx)
 {
 #if defined(CONFIG_BT_CTLR_PRIVACY)
 	return (((lll->filter_policy & SCAN_FP_FILTER) == 0U) &&
@@ -173,6 +173,26 @@ bool lll_scan_isr_rx_check(const struct lll_scan *lll, uint8_t irkmatch_ok, uint
 
 	return ((lll->filter_policy & SCAN_FP_FILTER) == 0U) || devmatch_ok;
 #endif /* !CONFIG_BT_CTLR_PRIVACY */
+}
+
+bool lll_scan_isr_rx_filter(const struct lll_scan *lll, struct lll_addr_match *match,
+			    uint8_t rl_idx)
+{
+	bool allow;
+
+	allow = isr_rx_check(lll, match->irkmatch_ok, match->devmatch_ok, rl_idx);
+
+#if defined(CONFIG_BT_CTLR_SYNC_PERIODIC) && defined(CONFIG_BT_CTLR_FILTER_ACCEPT_LIST)
+	/* Reported only if the filter policy allows it */
+	match->devmatch_ok = allow;
+
+	/* Received anyway while a sync is being created, for the ULL to look
+	 * for the periodic advertiser in it.
+	 */
+	return allow || lll->is_sync;
+#else /* !CONFIG_BT_CTLR_SYNC_PERIODIC || !CONFIG_BT_CTLR_FILTER_ACCEPT_LIST */
+	return allow;
+#endif /* !CONFIG_BT_CTLR_SYNC_PERIODIC || !CONFIG_BT_CTLR_FILTER_ACCEPT_LIST */
 }
 
 #if defined(CONFIG_BT_CENTRAL) || defined(CONFIG_BT_CTLR_ADV_EXT)
@@ -631,7 +651,7 @@ static void isr_rx(const struct bsr_evt *e, void *param)
 
 	rl_idx = lll_scan_rl_idx_get(lll, &match);
 
-	if (has_adva && !lll_scan_isr_rx_check(lll, match.irkmatch_ok, match.devmatch_ok, rl_idx)) {
+	if (has_adva && !lll_scan_isr_rx_filter(lll, &match, rl_idx)) {
 		err = -EINVAL;
 
 		goto isr_rx_do_close;
@@ -954,7 +974,7 @@ static int isr_rx_pdu(struct lll_scan *lll, const struct bsr_evt *e, struct pdu_
 		int err;
 
 		/* save the adv packet */
-		err = isr_rx_scan_report(lll, e, match->irkmatch_ok, rl_idx, false);
+		err = isr_rx_scan_report(lll, e, match, rl_idx, false);
 		if (err) {
 			return err;
 		}
@@ -1030,7 +1050,7 @@ static int isr_rx_pdu(struct lll_scan *lll, const struct bsr_evt *e, struct pdu_
 		int err;
 
 		/* save the scan response packet */
-		err = isr_rx_scan_report(lll, e, match->irkmatch_ok, rl_idx, dir_report);
+		err = isr_rx_scan_report(lll, e, match, rl_idx, dir_report);
 		if (err) {
 			/* The auxiliary PDU is being received */
 			if (IS_ENABLED(CONFIG_BT_CTLR_ADV_EXT) && (err == -EBUSY)) {
@@ -1087,8 +1107,8 @@ static bool isr_scan_tgta_check(const struct lll_scan *lll, bool init, uint8_t a
 	       isr_scan_tgta_rpa_check(lll, addr_type, addr, dir_report);
 }
 
-static int isr_rx_scan_report(struct lll_scan *lll, const struct bsr_evt *e, uint8_t irkmatch_ok,
-			      uint8_t rl_idx, bool dir_report)
+static int isr_rx_scan_report(struct lll_scan *lll, const struct bsr_evt *e,
+			      const struct lll_addr_match *match, uint8_t rl_idx, bool dir_report)
 {
 	struct node_rx_pdu *node_rx;
 	int err = 0;
@@ -1143,13 +1163,12 @@ static int isr_rx_scan_report(struct lll_scan *lll, const struct bsr_evt *e, uin
 
 #if defined(CONFIG_BT_CTLR_PRIVACY)
 	/* save the resolving list index. */
-	node_rx->rx_ftr.rl_idx = irkmatch_ok ? rl_idx : FILTER_IDX_NONE;
+	node_rx->rx_ftr.rl_idx = match->irkmatch_ok ? rl_idx : FILTER_IDX_NONE;
 
 #if defined(CONFIG_BT_CTLR_ADV_EXT)
 	node_rx->rx_ftr.direct_resolved = (rl_idx != FILTER_IDX_NONE);
 #endif /* CONFIG_BT_CTLR_ADV_EXT */
 #else /* !CONFIG_BT_CTLR_PRIVACY */
-	ARG_UNUSED(irkmatch_ok);
 	ARG_UNUSED(rl_idx);
 #endif /* !CONFIG_BT_CTLR_PRIVACY */
 
@@ -1159,6 +1178,16 @@ static int isr_rx_scan_report(struct lll_scan *lll, const struct bsr_evt *e, uin
 #else /* !CONFIG_BT_CTLR_EXT_SCAN_FP */
 	ARG_UNUSED(dir_report);
 #endif /* !CONFIG_BT_CTLR_EXT_SCAN_FP */
+
+#if defined(CONFIG_BT_CTLR_SYNC_PERIODIC) && defined(CONFIG_BT_CTLR_FILTER_ACCEPT_LIST)
+	/* Reported if allowed by the filter policy */
+	node_rx->rx_ftr.devmatch = match->devmatch_ok;
+#endif /* CONFIG_BT_CTLR_SYNC_PERIODIC && CONFIG_BT_CTLR_FILTER_ACCEPT_LIST */
+
+#if !defined(CONFIG_BT_CTLR_PRIVACY) && \
+	!(defined(CONFIG_BT_CTLR_SYNC_PERIODIC) && defined(CONFIG_BT_CTLR_FILTER_ACCEPT_LIST))
+	ARG_UNUSED(match);
+#endif /* !CONFIG_BT_CTLR_PRIVACY && !(CONFIG_BT_CTLR_SYNC_PERIODIC && FILTER_ACCEPT_LIST) */
 
 	ull_rx_put_sched(node_rx->hdr.link, node_rx);
 

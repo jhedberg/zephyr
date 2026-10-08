@@ -15,6 +15,9 @@
  * AUX_SCAN_REQ tIFS after a scannable AUX_ADV_IND, and an initiator an
  * AUX_CONNECT_REQ tIFS after a connectable one, before listening for the
  * AUX_SCAN_RSP or AUX_CONNECT_RSP tIFS later.
+ *
+ * The auxiliary scan events that the ULL schedules for the chain PDUs of a
+ * periodic advertising train are given to the periodic sync (lll_sync.c).
  */
 
 #include <stdint.h>
@@ -47,6 +50,7 @@
 #include "lll_df_types.h"
 #include "lll_scan.h"
 #include "lll_scan_aux.h"
+#include "lll_sync.h"
 #include "lll_conn.h"
 #include "lll_filter.h"
 #include "lll_sched.h"
@@ -56,6 +60,7 @@
 #include "lll_radio.h"
 #include "lll_addr.h"
 #include "lll_scan_internal.h"
+#include "lll_sync_internal.h"
 
 #include "ll_feat.h"
 
@@ -197,9 +202,8 @@ static void rx(uint32_t start, uint32_t window_us)
 	lll_radio_rx(&evt.cfg, start, window_us, node_rx->pdu, isr_rx, NULL);
 }
 
-bool lll_scan_aux_setup(struct lll_scan *lll, struct lll_scan_aux *lll_aux,
-			const struct pdu_adv *pdu, uint8_t phy, uint32_t pdu_start_us,
-			uint32_t ticks_ref)
+bool lll_scan_aux_rx_get(const struct pdu_adv *pdu, uint8_t phy, uint32_t pdu_start_us,
+			 struct lll_scan_aux_rx *rx)
 {
 	const struct pdu_adv_aux_ptr *aux_ptr;
 	uint32_t window_widening_us;
@@ -207,7 +211,6 @@ bool lll_scan_aux_setup(struct lll_scan *lll, struct lll_scan_aux *lll_aux,
 	uint32_t aux_offset_us;
 	uint32_t overhead_us;
 	uint32_t pdu_us;
-	uint8_t phy_aux;
 
 	aux_ptr = aux_ptr_get(pdu);
 	if (!aux_ptr || !PDU_ADV_AUX_PTR_OFFSET_GET(aux_ptr) ||
@@ -218,10 +221,10 @@ bool lll_scan_aux_setup(struct lll_scan *lll, struct lll_scan_aux *lll_aux,
 	/* The radio model has no Coded PHY */
 	switch (PDU_ADV_AUX_PTR_PHY_GET(aux_ptr)) {
 	case EXT_ADV_AUX_PHY_LE_1M:
-		phy_aux = PHY_1M;
+		rx->phy = PHY_1M;
 		break;
 	case EXT_ADV_AUX_PHY_LE_2M:
-		phy_aux = PHY_2M;
+		rx->phy = PHY_2M;
 		break;
 	default:
 		return false;
@@ -251,19 +254,36 @@ bool lll_scan_aux_setup(struct lll_scan *lll, struct lll_scan_aux *lll_aux,
 		return false;
 	}
 
+	/* The PDU starts within the offset unit after the aux offset, plus or
+	 * minus the clock drift of the advertiser.
+	 */
+	rx->chan = aux_ptr->chan_idx;
+	rx->start = pdu_start_us + aux_offset_us - window_widening_us - EVENT_JITTER_US;
+	rx->window_us = ((window_widening_us + EVENT_JITTER_US) << 1) + window_size_us +
+			addr_us_get(rx->phy);
+
+	return true;
+}
+
+bool lll_scan_aux_setup(struct lll_scan *lll, struct lll_scan_aux *lll_aux,
+			const struct pdu_adv *pdu, uint8_t phy, uint32_t pdu_start_us,
+			uint32_t ticks_ref)
+{
+	struct lll_scan_aux_rx aux_rx;
+
+	if (!lll_scan_aux_rx_get(pdu, phy, pdu_start_us, &aux_rx)) {
+		return false;
+	}
+
 	trx_cnt = 0U;
 
 	evt.lll = lll;
 	evt.lll_aux = lll_aux;
-	evt.phy = phy_aux;
+	evt.phy = aux_rx.phy;
 	evt.ticks_ref = ticks_ref;
-	cfg_set(lll, phy_aux, aux_ptr->chan_idx);
+	cfg_set(lll, aux_rx.phy, aux_rx.chan);
 
-	/* The PDU starts within the offset unit after the aux offset, plus or
-	 * minus the clock drift of the advertiser.
-	 */
-	rx(pdu_start_us + aux_offset_us - window_widening_us - EVENT_JITTER_US,
-	   ((window_widening_us + EVENT_JITTER_US) << 1) + window_size_us + addr_us_get(phy_aux));
+	rx(aux_rx.start, aux_rx.window_us);
 
 	return true;
 }
@@ -272,22 +292,51 @@ static int prepare_cb(struct lll_prepare_param *p)
 {
 	struct lll_scan_aux *lll_aux;
 	struct lll_scan *lll;
+	uint8_t is_lll_scan;
 	uint32_t start_us;
 	int err;
 
 	DEBUG_RADIO_START_O(1);
 
 	lll_aux = p->param;
-	lll = ull_scan_aux_lll_parent_get(lll_aux, NULL);
+	lll = ull_scan_aux_lll_parent_get(lll_aux, &is_lll_scan);
 
 	trx_cnt = 0U;
+
+#if defined(CONFIG_BT_CENTRAL)
+	evt.node_conn_rx = NULL;
+#endif /* CONFIG_BT_CENTRAL */
+
+#if defined(CONFIG_BT_CTLR_SYNC_PERIODIC)
+	/* Chain PDUs of a periodic advertising train, received by the
+	 * periodic sync (see lll_sync.c).
+	 */
+	if (!is_lll_scan) {
+		if (lll_preempt_calc(p)) {
+			lll_radio_stop(isr_done, lll_aux);
+
+			return -ECANCELED;
+		}
+
+		start_us = lll_event_start_get(p, &evt.ticks_ref);
+		lll_sync_aux_prepare_cb((void *)lll, lll_aux, start_us, evt.ticks_ref);
+
+		err = lll_prepare_done(lll_aux);
+		LL_ASSERT_ERR(!err);
+
+		DEBUG_RADIO_START_O(1);
+
+		return 0;
+	}
+#else /* !CONFIG_BT_CTLR_SYNC_PERIODIC */
+	ARG_UNUSED(is_lll_scan);
+#endif /* !CONFIG_BT_CTLR_SYNC_PERIODIC */
 
 	evt.lll = lll;
 	evt.lll_aux = lll_aux;
 	evt.phy = lll_aux->phy;
-#if defined(CONFIG_BT_CENTRAL)
-	evt.node_conn_rx = NULL;
 
+#if defined(CONFIG_BT_CENTRAL)
 	/* Not started if stopped on connection establishment race between
 	 * LLL and ULL.
 	 */
@@ -375,6 +424,10 @@ static void abort_cb(struct lll_prepare_param *prepare_param, void *param)
 {
 	struct event_done_extra *e;
 	int err;
+#if defined(CONFIG_BT_CTLR_SYNC_PERIODIC)
+	uint8_t is_lll_scan;
+	void *parent;
+#endif /* CONFIG_BT_CTLR_SYNC_PERIODIC */
 
 	/* NOTE: This is not a prepare being cancelled */
 	if (!prepare_param) {
@@ -389,6 +442,17 @@ static void abort_cb(struct lll_prepare_param *prepare_param, void *param)
 	 */
 	err = lll_hfclock_off();
 	LL_ASSERT_ERR(err >= 0);
+
+#if defined(CONFIG_BT_CTLR_SYNC_PERIODIC)
+	/* The chain PDUs of a periodic advertising train are not received */
+	parent = ull_scan_aux_lll_parent_get(param, &is_lll_scan);
+	if (!is_lll_scan) {
+		lll_sync_isr_aux_release(parent, param);
+		lll_done(param);
+
+		return;
+	}
+#endif /* CONFIG_BT_CTLR_SYNC_PERIODIC */
 
 	e = ull_done_extra_type_set(EVENT_DONE_EXTRA_TYPE_SCAN_AUX);
 	LL_ASSERT_ERR(e);
@@ -405,10 +469,25 @@ static void isr_done(const struct bsr_evt *e, void *param)
 {
 	struct lll_scan_aux *lll_aux = param;
 	struct lll_scan *lll;
+	uint8_t is_lll_scan;
 
 	ARG_UNUSED(e);
 
-	lll = ull_scan_aux_lll_parent_get(lll_aux, NULL);
+	lll = ull_scan_aux_lll_parent_get(lll_aux, &is_lll_scan);
+
+#if defined(CONFIG_BT_CTLR_SYNC_PERIODIC)
+	/* The chain PDUs of a periodic advertising train were not all
+	 * received.
+	 */
+	if (!is_lll_scan) {
+		lll_sync_isr_aux_release((void *)lll, lll_aux);
+		lll_isr_cleanup(lll_aux);
+
+		return;
+	}
+#else /* !CONFIG_BT_CTLR_SYNC_PERIODIC */
+	ARG_UNUSED(is_lll_scan);
+#endif /* !CONFIG_BT_CTLR_SYNC_PERIODIC */
 
 #if defined(CONFIG_BT_CENTRAL)
 	/* No AUX_CONNECT_RSP to the AUX_CONNECT_REQ sent */
@@ -481,7 +560,7 @@ static void isr_rx(const struct bsr_evt *e, void *param)
 	/* The filter policy applies to a PDU with an AdvA */
 	if (lll_addr_match_ext(pdu, evt.filter, evt.resolve, &match)) {
 		rl_idx = lll_scan_rl_idx_get(lll, &match);
-		if (!lll_scan_isr_rx_check(lll, match.irkmatch_ok, match.devmatch_ok, rl_idx)) {
+		if (!lll_scan_isr_rx_filter(lll, &match, rl_idx)) {
 			err = -EINVAL;
 
 			goto isr_rx_do_close;
@@ -542,8 +621,8 @@ static void isr_tx_scan_req(const struct bsr_evt *e, void *param)
 		     lll_radio_tifs_rx_window(evt.phy), node_rx->pdu, isr_rx, NULL);
 }
 
-static void ftr_fill(struct node_rx_ftr *ftr, const struct bsr_evt *e, uint8_t irkmatch_ok,
-		     uint8_t rl_idx, bool dir_report)
+static void ftr_fill(struct node_rx_ftr *ftr, const struct bsr_evt *e,
+		     const struct lll_addr_match *match, uint8_t rl_idx, bool dir_report)
 {
 	ftr->ticks_anchor = evt.ticks_ref;
 	ftr->radio_end_us = e->ts_end - HAL_TICKER_TICKS_TO_US(evt.ticks_ref);
@@ -551,9 +630,8 @@ static void ftr_fill(struct node_rx_ftr *ftr, const struct bsr_evt *e, uint8_t i
 	ftr->rssi = lll_rssi_get(e->rssi);
 
 #if defined(CONFIG_BT_CTLR_PRIVACY)
-	ftr->rl_idx = irkmatch_ok ? rl_idx : FILTER_IDX_NONE;
+	ftr->rl_idx = match->irkmatch_ok ? rl_idx : FILTER_IDX_NONE;
 #else /* !CONFIG_BT_CTLR_PRIVACY */
-	ARG_UNUSED(irkmatch_ok);
 	ARG_UNUSED(rl_idx);
 #endif /* !CONFIG_BT_CTLR_PRIVACY */
 
@@ -562,6 +640,16 @@ static void ftr_fill(struct node_rx_ftr *ftr, const struct bsr_evt *e, uint8_t i
 #else /* !CONFIG_BT_CTLR_EXT_SCAN_FP */
 	ARG_UNUSED(dir_report);
 #endif /* !CONFIG_BT_CTLR_EXT_SCAN_FP */
+
+#if defined(CONFIG_BT_CTLR_SYNC_PERIODIC) && defined(CONFIG_BT_CTLR_FILTER_ACCEPT_LIST)
+	/* Reported if allowed by the filter policy */
+	ftr->devmatch = match->devmatch_ok;
+#endif /* CONFIG_BT_CTLR_SYNC_PERIODIC && CONFIG_BT_CTLR_FILTER_ACCEPT_LIST */
+
+#if !defined(CONFIG_BT_CTLR_PRIVACY) && \
+	!(defined(CONFIG_BT_CTLR_SYNC_PERIODIC) && defined(CONFIG_BT_CTLR_FILTER_ACCEPT_LIST))
+	ARG_UNUSED(match);
+#endif /* !CONFIG_BT_CTLR_PRIVACY && !(CONFIG_BT_CTLR_SYNC_PERIODIC && FILTER_ACCEPT_LIST) */
 }
 
 static int isr_rx_pdu(struct lll_scan *lll, struct lll_scan_aux *lll_aux,
@@ -745,7 +833,7 @@ static int isr_rx_pdu(struct lll_scan *lll, struct lll_scan_aux *lll_aux,
 			ftr->lll_aux = lll->lll_aux;
 			lll->lll_aux->state = 1U;
 		}
-		ftr_fill(ftr, e, match->irkmatch_ok, rl_idx, dir_report);
+		ftr_fill(ftr, e, match, rl_idx, dir_report);
 		ftr->scan_req = 1U;
 		ftr->scan_rsp = 0U;
 		ftr->aux_lll_sched = 0U;
@@ -798,7 +886,7 @@ static int isr_rx_pdu(struct lll_scan *lll, struct lll_scan_aux *lll_aux,
 
 		node_rx->hdr.type = NODE_RX_TYPE_EXT_AUX_REPORT;
 
-		ftr_fill(ftr, e, match->irkmatch_ok, rl_idx, dir_report);
+		ftr_fill(ftr, e, match, rl_idx, dir_report);
 		ftr->scan_req = 0U;
 		ftr->aux_lll_sched = lll_scan_aux_setup(lll, lll_aux, pdu, evt.phy, e->ts_start,
 							evt.ticks_ref);

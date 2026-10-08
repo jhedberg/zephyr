@@ -17,9 +17,14 @@ void lll_scan_filter_get(const struct lll_scan *lll, const struct lll_filter **f
 /* Resolving list index of a received AdvA */
 uint8_t lll_scan_rl_idx_get(const struct lll_scan *lll, const struct lll_addr_match *match);
 
-/* Filter policy check of a received AdvA */
-bool lll_scan_isr_rx_check(const struct lll_scan *lll, uint8_t irkmatch_ok, uint8_t devmatch_ok,
-			   uint8_t rl_idx);
+/* Filter policy check of a received AdvA. Returns false if the PDU is to be
+ * dropped. While a periodic advertising sync is being created with the Filter
+ * Accept List enabled, a PDU that the filter policy rejects is still received
+ * for the ULL to look for the periodic advertiser in it, and
+ * match->devmatch_ok is then set to whether it is reported.
+ */
+bool lll_scan_isr_rx_filter(const struct lll_scan *lll, struct lll_addr_match *match,
+			    uint8_t rl_idx);
 
 /* Initiator check of the AdvA of a received PDU, without a filter accept
  * list.
@@ -52,6 +57,23 @@ void lll_scan_isr_resume(struct lll_scan *lll);
  * started by the scan event, when they end without a last report.
  */
 void lll_scan_isr_aux_release(struct lll_scan *lll);
+
+/* Reception of an auxiliary PDU in the radio event of the PDU with the AuxPtr
+ * that points to it.
+ */
+struct lll_scan_aux_rx {
+	uint32_t start;     /* Start of the reception */
+	uint32_t window_us; /* Window to receive the access address in */
+	uint8_t phy;        /* PHY_1M or PHY_2M */
+	uint8_t chan;
+};
+
+/* Get the reception of the auxiliary PDU that the AuxPtr of a PDU received on
+ * phy from pdu_start_us points to. Returns false if the PDU has no valid
+ * AuxPtr, or if the ULL has the time to schedule the reception.
+ */
+bool lll_scan_aux_rx_get(const struct pdu_adv *pdu, uint8_t phy, uint32_t pdu_start_us,
+			 struct lll_scan_aux_rx *rx);
 
 /* Listen for the auxiliary PDU that the AuxPtr of a PDU received on phy from
  * pdu_start_us points to, when it is too soon for the ULL to schedule it.

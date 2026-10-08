@@ -51,6 +51,7 @@
 #include "lll_adv.h"
 #include "lll_adv_pdu.h"
 #include "lll_adv_aux.h"
+#include "lll_adv_sync.h"
 #include "lll_df_types.h"
 #include "lll_conn.h"
 #include "lll_filter.h"
@@ -96,30 +97,54 @@ static struct {
 
 int lll_adv_init(void)
 {
-#if defined(CONFIG_BT_CTLR_ADV_EXT) && (CONFIG_BT_CTLR_ADV_AUX_SET > 0)
 	int err;
 
+#if defined(CONFIG_BT_CTLR_ADV_EXT) && (CONFIG_BT_CTLR_ADV_AUX_SET > 0)
 	err = lll_adv_aux_init();
 	if (err) {
 		return err;
 	}
 #endif /* CONFIG_BT_CTLR_ADV_EXT && (CONFIG_BT_CTLR_ADV_AUX_SET > 0) */
 
-	return lll_adv_pdu_init_reset();
+#if defined(CONFIG_BT_CTLR_ADV_PERIODIC)
+	err = lll_adv_sync_init();
+	if (err) {
+		return err;
+	}
+#endif /* CONFIG_BT_CTLR_ADV_PERIODIC */
+
+	err = lll_adv_pdu_init_reset();
+	if (err) {
+		return err;
+	}
+
+	return 0;
 }
 
 int lll_adv_reset(void)
 {
-#if defined(CONFIG_BT_CTLR_ADV_EXT) && (CONFIG_BT_CTLR_ADV_AUX_SET > 0)
 	int err;
 
+#if defined(CONFIG_BT_CTLR_ADV_EXT) && (CONFIG_BT_CTLR_ADV_AUX_SET > 0)
 	err = lll_adv_aux_reset();
 	if (err) {
 		return err;
 	}
 #endif /* CONFIG_BT_CTLR_ADV_EXT && (CONFIG_BT_CTLR_ADV_AUX_SET > 0) */
 
-	return lll_adv_pdu_init_reset();
+#if defined(CONFIG_BT_CTLR_ADV_PERIODIC)
+	err = lll_adv_sync_reset();
+	if (err) {
+		return err;
+	}
+#endif /* CONFIG_BT_CTLR_ADV_PERIODIC */
+
+	err = lll_adv_pdu_init_reset();
+	if (err) {
+		return err;
+	}
+
+	return 0;
 }
 
 void lll_adv_filter_get(const struct lll_adv *lll, const struct lll_filter **filter,
