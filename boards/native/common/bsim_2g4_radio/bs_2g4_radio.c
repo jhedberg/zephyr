@@ -118,6 +118,15 @@ static struct {
 	bs_time_t timer_end;
 } bsr;
 
+/* Test cheats (bsr_testcheat_*()), kept over bsr_init() */
+static struct {
+	double tx_power_offset;
+	double rx_power_offset;
+	int64_t tx_disabled;
+	int64_t rx_dont_sync;
+	int64_t rx_fail_crc;
+} cheat;
+
 static bs_time_t timer_cntr = TIME_NEVER;
 static bool cntr_cmp_evt;
 /* Start and end of operations */
@@ -129,6 +138,35 @@ static void radio_timer_update(void)
 {
 	timer_radio = BS_MIN(bsr.timer_start, bsr.timer_end);
 	nsi_hws_find_next_event();
+}
+
+/* Whether a test cheat applies to this packet, counting it */
+static bool cheat_applies(int64_t *count)
+{
+	if (*count == 0) {
+		return false;
+	}
+
+	if (*count > 0) {
+		(*count)--;
+	}
+
+	return true;
+}
+
+static int8_t rssi_dbm_get(p2G4_rssi_power_t rssi)
+{
+	double dbm = p2G4_RSSI_value_to_dBm(rssi) + cheat.rx_power_offset;
+
+	if (dbm < INT8_MIN) {
+		return INT8_MIN;
+	}
+
+	if (dbm > INT8_MAX) {
+		return INT8_MAX;
+	}
+
+	return (int8_t)dbm;
 }
 
 static uint8_t rev_8(uint8_t in)
@@ -375,7 +413,11 @@ static void rx_end_handle(struct op *op)
 			status = BSR_STATUS_CRC_ERR;
 		}
 
-		op->evt.rssi = (int8_t)p2G4_RSSI_value_to_dBm(op->rx_done.rssi.RSSI);
+		if ((status == BSR_STATUS_OK) && cheat_applies(&cheat.rx_fail_crc)) {
+			status = BSR_STATUS_CRC_ERR;
+		}
+
+		op->evt.rssi = rssi_dbm_get(op->rx_done.rssi.RSSI);
 		op->evt.len = (size >= BSR_PDU_HEADER_LEN) ? MIN(op->pkt[1], op->cfg.max_len) : 0U;
 	}
 
@@ -438,7 +480,7 @@ static void tx_start(struct op *op)
 	memset(req, 0, sizeof(*req));
 	radio_params_set(&req->radio_params, &op->cfg);
 	req->phy_address = op->cfg.aa;
-	req->power_level = p2G4_power_from_d(op->cfg.tx_power);
+	req->power_level = p2G4_power_from_d(op->cfg.tx_power + cheat.tx_power_offset);
 	req->packet_size = op->pkt_len;
 	req->coding_rate = 0;
 	req->start_tx_time = bsr_plat_phy_time_from_dev(op->start);
@@ -449,6 +491,13 @@ static void tx_start(struct op *op)
 
 	op->evt.ts_start = (uint32_t)op->start;
 	op->evt.ts_aa_end = (uint32_t)(op->start + pream_and_addr_us(op->cfg.phy));
+
+	if (cheat_applies(&cheat.tx_disabled)) {
+		/* Not sent on air, but it ends as if it had been */
+		op->evt.status = BSR_STATUS_OK;
+		phy_op_ended(op, op->start + dur);
+		return;
+	}
 
 	op->state = OP_IN_PHY;
 	bsr.phy_op = op;
@@ -484,7 +533,7 @@ static void rx_start(struct op *op)
 	req->prelocked_tx = false;
 	req->resp_type = 0;
 	req->n_addr = 1;
-	op->rx_addr[0] = op->cfg.aa;
+	op->rx_addr[0] = cheat_applies(&cheat.rx_dont_sync) ? 0xDEADBEAFU : op->cfg.aa;
 	abort_struct_update(op, &req->abort, &recheck);
 
 	op->state = OP_IN_PHY;
@@ -754,6 +803,27 @@ void bsr_abort(void)
 	}
 
 	radio_timer_update();
+}
+
+void bsr_testcheat_set_tx_power_gain(double power_offset)
+{
+	cheat.tx_power_offset = power_offset;
+}
+
+void bsr_testcheat_set_rx_power_gain(double power_offset)
+{
+	cheat.rx_power_offset = power_offset;
+}
+
+void bsr_testcheat_disable_tx(int64_t count)
+{
+	cheat.tx_disabled = count;
+}
+
+void bsr_testcheat_disable_rx(int64_t count_dont_sync, int64_t count_fail_crc)
+{
+	cheat.rx_dont_sync = count_dont_sync;
+	cheat.rx_fail_crc = count_fail_crc;
 }
 
 int bsr_evt_get(struct bsr_evt *evt)

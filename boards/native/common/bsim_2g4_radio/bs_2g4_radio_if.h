@@ -121,6 +121,29 @@ void bsr_abort(void);
  */
 int bsr_evt_get(struct bsr_evt *evt);
 
+/*
+ * Test cheats, to change the behavior of the radio in tests. They are those
+ * of the hw_testcheat_if.h interface of the nRF HW models, with the same
+ * semantics. A count of -1 applies to all following packets, and 0 stops
+ * the cheat.
+ */
+
+/* Offset the Tx power by power_offset dBs */
+void bsr_testcheat_set_tx_power_gain(double power_offset);
+
+/* Offset the measured Rx power (RSSI) by power_offset dBs */
+void bsr_testcheat_set_rx_power_gain(double power_offset);
+
+/* Do not send the next count packets on air. They appear sent nonetheless. */
+void bsr_testcheat_disable_tx(int64_t count);
+
+/*
+ * Do not synchronize to any packet in the next count_dont_sync receptions,
+ * and report the next count_fail_crc packets received with a valid CRC with
+ * a CRC error.
+ */
+void bsr_testcheat_disable_rx(int64_t count_dont_sync, int64_t count_fail_crc);
+
 #ifdef __cplusplus
 }
 #endif
