@@ -57,6 +57,7 @@ static void isr_rx(const struct bsr_evt *e, void *param);
 static struct {
 	struct bsr_pkt_cfg cfg;
 	const struct lll_filter *filter;
+	bool resolve;
 
 	/* The times reported to the ULL are relative to the current scan
 	 * window.
@@ -157,14 +158,31 @@ static void ticker_op_start_cb(uint32_t status, void *param)
 	LL_ASSERT_ERR(status == TICKER_STATUS_SUCCESS);
 }
 
-static bool rx_filter_check(const struct lll_scan *lll, uint8_t devmatch_ok)
+static bool rx_filter_check(const struct lll_scan *lll, uint8_t irkmatch_ok, uint8_t devmatch_ok,
+			    uint8_t rl_idx)
 {
-	return ((lll->filter_policy & SCAN_FP_FILTER) == 0U) || (devmatch_ok != 0U);
+	if ((lll->filter_policy & SCAN_FP_FILTER) == 0U) {
+		return !IS_ENABLED(CONFIG_BT_CTLR_PRIVACY) || (devmatch_ok == 0U) ||
+		       ull_filter_lll_rl_idx_allowed(irkmatch_ok, rl_idx);
+	}
+
+	return (devmatch_ok != 0U) ||
+	       (IS_ENABLED(CONFIG_BT_CTLR_PRIVACY) && ull_filter_lll_irk_in_fal(rl_idx));
 }
 
 #if defined(CONFIG_BT_CENTRAL)
-static bool init_adva_check(const struct lll_scan *lll, uint8_t addr_type, const uint8_t *addr)
+static bool init_adva_check(const struct lll_scan *lll, uint8_t addr_type, const uint8_t *addr,
+			    uint8_t rl_idx)
 {
+#if defined(CONFIG_BT_CTLR_PRIVACY)
+	/* Only applies to initiator with no filter accept list */
+	if (rl_idx != FILTER_IDX_NONE) {
+		return (rl_idx == lll->rl_idx);
+	} else if (!ull_filter_lll_rl_addr_allowed(addr_type, addr, &rl_idx)) {
+		return false;
+	}
+#endif /* CONFIG_BT_CTLR_PRIVACY */
+
 	return (lll->adv_addr_type == addr_type) && (memcmp(lll->adv_addr, addr, BDADDR_SIZE) == 0);
 }
 
@@ -317,9 +335,20 @@ static inline bool isr_scan_tgta_rpa_check(const struct lll_scan *lll, uint8_t a
 	return false;
 }
 
-static bool isr_scan_tgta_check(const struct lll_scan *lll, uint8_t addr_type, const uint8_t *addr,
-				bool *dir_report)
+static bool isr_scan_tgta_check(const struct lll_scan *lll, bool init, uint8_t addr_type,
+				const uint8_t *addr, uint8_t rl_idx, bool *dir_report)
 {
+#if defined(CONFIG_BT_CTLR_PRIVACY)
+	if (ull_filter_lll_rl_addr_resolve(addr_type, addr, rl_idx)) {
+		return true;
+	} else if (init && (lll->rpa_gen != 0U) && (ull_filter_lll_lrpa_get(rl_idx) != NULL)) {
+		/* Initiator generating RPAs, and could not resolve TargetA:
+		 * discard
+		 */
+		return false;
+	}
+#endif /* CONFIG_BT_CTLR_PRIVACY */
+
 	if ((lll->init_addr_type == addr_type) &&
 	    (memcmp(lll->init_addr, addr, BDADDR_SIZE) == 0)) {
 		return true;
@@ -331,7 +360,8 @@ static bool isr_scan_tgta_check(const struct lll_scan *lll, uint8_t addr_type, c
 	return isr_scan_tgta_rpa_check(lll, addr_type, addr, dir_report);
 }
 
-static int isr_rx_scan_report(struct lll_scan *lll, const struct bsr_evt *e, bool dir_report)
+static int isr_rx_scan_report(struct lll_scan *lll, const struct bsr_evt *e, uint8_t irkmatch_ok,
+			      uint8_t rl_idx, bool dir_report)
 {
 	struct node_rx_pdu *node_rx;
 
@@ -346,6 +376,13 @@ static int isr_rx_scan_report(struct lll_scan *lll, const struct bsr_evt *e, boo
 	node_rx->hdr.type = NODE_RX_TYPE_REPORT;
 
 	node_rx->rx_ftr.rssi = lll_rssi_get(e->rssi);
+
+#if defined(CONFIG_BT_CTLR_PRIVACY)
+	node_rx->rx_ftr.rl_idx = (irkmatch_ok != 0U) ? rl_idx : FILTER_IDX_NONE;
+#else /* !CONFIG_BT_CTLR_PRIVACY */
+	ARG_UNUSED(irkmatch_ok);
+	ARG_UNUSED(rl_idx);
+#endif /* !CONFIG_BT_CTLR_PRIVACY */
 
 #if defined(CONFIG_BT_CTLR_EXT_SCAN_FP)
 	node_rx->rx_ftr.direct = dir_report;
@@ -428,10 +465,10 @@ static bool adv_ind_len_check(const struct pdu_adv *pdu)
 }
 
 #if defined(CONFIG_BT_CENTRAL)
-static bool init_pdu_check(const struct lll_scan *lll, const struct pdu_adv *pdu)
+static bool init_pdu_check(const struct lll_scan *lll, const struct pdu_adv *pdu, uint8_t rl_idx)
 {
 	if (((lll->filter_policy & SCAN_FP_FILTER) == 0U) &&
-	    !init_adva_check(lll, pdu->tx_addr, pdu->adv_ind.addr)) {
+	    !init_adva_check(lll, pdu->tx_addr, pdu->adv_ind.addr, rl_idx)) {
 		return false;
 	}
 
@@ -441,10 +478,11 @@ static bool init_pdu_check(const struct lll_scan *lll, const struct pdu_adv *pdu
 
 	return (pdu->type == PDU_ADV_TYPE_DIRECT_IND) &&
 	       (pdu->len == sizeof(struct pdu_adv_direct_ind)) &&
-	       isr_scan_tgta_check(lll, pdu->rx_addr, pdu->direct_ind.tgt_addr, NULL);
+	       isr_scan_tgta_check(lll, true, pdu->rx_addr, pdu->direct_ind.tgt_addr, rl_idx, NULL);
 }
 
-static int isr_rx_init(struct lll_scan *lll, const struct bsr_evt *e, struct pdu_adv *pdu_adv_rx)
+static int isr_rx_init(struct lll_scan *lll, const struct bsr_evt *e, struct pdu_adv *pdu_adv_rx,
+		       const struct lll_addr_match *match, uint8_t rl_idx)
 {
 	struct node_rx_ftr *ftr;
 	struct node_rx_pdu *rx;
@@ -455,6 +493,9 @@ static int isr_rx_init(struct lll_scan *lll, const struct bsr_evt *e, struct pdu
 	uint8_t init_tx_addr;
 	uint8_t *init_addr;
 	uint8_t chan_sel;
+#if defined(CONFIG_BT_CTLR_PRIVACY)
+	bt_addr_t *lrpa;
+#endif /* CONFIG_BT_CTLR_PRIVACY */
 
 	if (IS_ENABLED(CONFIG_BT_CTLR_CHAN_SEL_2)) {
 		rx = ull_pdu_rx_alloc_peek(4);
@@ -483,6 +524,13 @@ static int isr_rx_init(struct lll_scan *lll, const struct bsr_evt *e, struct pdu
 
 	init_tx_addr = lll->init_addr_type;
 	init_addr = lll->init_addr;
+#if defined(CONFIG_BT_CTLR_PRIVACY)
+	lrpa = ull_filter_lll_lrpa_get(rl_idx);
+	if ((lll->rpa_gen != 0U) && (lrpa != NULL)) {
+		init_tx_addr = 1U;
+		init_addr = lrpa->val;
+	}
+#endif /* CONFIG_BT_CTLR_PRIVACY */
 
 	pdu_tx = &evt.pdu_tx;
 	prepare_connect_ind(lll, e, pdu_tx, pdu_adv_rx->tx_addr, pdu_adv_rx->adv_ind.addr,
@@ -520,6 +568,13 @@ static int isr_rx_init(struct lll_scan *lll, const struct bsr_evt *e, struct pdu
 	ftr->ticks_anchor = evt.ticks_ref;
 	ftr->radio_end_us = conn_space_us;
 
+#if defined(CONFIG_BT_CTLR_PRIVACY)
+	ftr->rl_idx = (match->irkmatch_ok != 0U) ? rl_idx : FILTER_IDX_NONE;
+	ftr->lrpa_used = (lll->rpa_gen != 0U) && (lrpa != NULL);
+#else /* !CONFIG_BT_CTLR_PRIVACY */
+	ARG_UNUSED(match);
+#endif /* !CONFIG_BT_CTLR_PRIVACY */
+
 	if (IS_ENABLED(CONFIG_BT_CTLR_CHAN_SEL_2)) {
 		ftr->extra = ull_pdu_rx_alloc();
 	}
@@ -537,12 +592,16 @@ static bool scan_req_pdu_check(const struct lll_scan *lll, const struct pdu_adv 
 }
 
 static int isr_rx_scan_req(struct lll_scan *lll, const struct bsr_evt *e,
-			   const struct pdu_adv *pdu_adv_rx)
+			   const struct pdu_adv *pdu_adv_rx, const struct lll_addr_match *match,
+			   uint8_t rl_idx)
 {
 	struct pdu_adv *pdu_tx;
+#if defined(CONFIG_BT_CTLR_PRIVACY)
+	bt_addr_t *lrpa;
+#endif /* CONFIG_BT_CTLR_PRIVACY */
 	int err;
 
-	err = isr_rx_scan_report(lll, e, false);
+	err = isr_rx_scan_report(lll, e, match->irkmatch_ok, rl_idx, false);
 	if (err != 0) {
 		return err;
 	}
@@ -555,6 +614,13 @@ static int isr_rx_scan_req(struct lll_scan *lll, const struct bsr_evt *e,
 	pdu_tx->rx_addr = pdu_adv_rx->tx_addr;
 	pdu_tx->len = sizeof(struct pdu_adv_scan_req);
 	(void)memcpy(&pdu_tx->scan_req.scan_addr[0], &lll->init_addr[0], BDADDR_SIZE);
+#if defined(CONFIG_BT_CTLR_PRIVACY)
+	lrpa = ull_filter_lll_lrpa_get(rl_idx);
+	if ((lll->rpa_gen != 0U) && (lrpa != NULL)) {
+		pdu_tx->tx_addr = 1U;
+		(void)memcpy(&pdu_tx->scan_req.scan_addr[0], lrpa->val, BDADDR_SIZE);
+	}
+#endif /* CONFIG_BT_CTLR_PRIVACY */
 	(void)memcpy(&pdu_tx->scan_req.adv_addr[0], &pdu_adv_rx->adv_ind.addr[0], BDADDR_SIZE);
 
 	lll->state = 1U;
@@ -565,7 +631,7 @@ static int isr_rx_scan_req(struct lll_scan *lll, const struct bsr_evt *e,
 }
 
 static bool report_pdu_check(const struct lll_scan *lll, const struct pdu_adv *pdu,
-			     bool *dir_report)
+			     uint8_t rl_idx, bool *dir_report)
 {
 	if ((pdu->type == PDU_ADV_TYPE_ADV_IND) || (pdu->type == PDU_ADV_TYPE_NONCONN_IND) ||
 	    (pdu->type == PDU_ADV_TYPE_SCAN_IND)) {
@@ -574,37 +640,40 @@ static bool report_pdu_check(const struct lll_scan *lll, const struct pdu_adv *p
 
 	if (pdu->type == PDU_ADV_TYPE_DIRECT_IND) {
 		return (pdu->len == sizeof(struct pdu_adv_direct_ind)) &&
-		       isr_scan_tgta_check(lll, pdu->rx_addr, pdu->direct_ind.tgt_addr, dir_report);
+		       isr_scan_tgta_check(lll, false, pdu->rx_addr, pdu->direct_ind.tgt_addr,
+					   rl_idx, dir_report);
 	}
 
 	return scan_rsp_check(lll, pdu);
 }
 
-static int isr_rx_pdu(struct lll_scan *lll, const struct bsr_evt *e, struct pdu_adv *pdu_adv_rx)
+static int isr_rx_pdu(struct lll_scan *lll, const struct bsr_evt *e, struct pdu_adv *pdu_adv_rx,
+		      const struct lll_addr_match *match, uint8_t rl_idx)
 {
 	bool dir_report = false;
 	int err;
 
 #if defined(CONFIG_BT_CENTRAL)
 	if (lll->conn != NULL) {
-		if ((lll->conn->central.cancelled != 0U) || !init_pdu_check(lll, pdu_adv_rx)) {
+		if ((lll->conn->central.cancelled != 0U) ||
+		    !init_pdu_check(lll, pdu_adv_rx, rl_idx)) {
 			return -EINVAL;
 		}
 
-		return isr_rx_init(lll, e, pdu_adv_rx);
+		return isr_rx_init(lll, e, pdu_adv_rx, match, rl_idx);
 	}
 #endif /* CONFIG_BT_CENTRAL */
 
 	/* A PDU that the backoff holds the request for is only reported */
 	if (scan_req_pdu_check(lll, pdu_adv_rx) && backoff_is_req()) {
-		return isr_rx_scan_req(lll, e, pdu_adv_rx);
+		return isr_rx_scan_req(lll, e, pdu_adv_rx, match, rl_idx);
 	}
 
-	if (!report_pdu_check(lll, pdu_adv_rx, &dir_report)) {
+	if (!report_pdu_check(lll, pdu_adv_rx, rl_idx, &dir_report)) {
 		return -EINVAL;
 	}
 
-	err = isr_rx_scan_report(lll, e, dir_report);
+	err = isr_rx_scan_report(lll, e, match->irkmatch_ok, rl_idx, dir_report);
 	if (err != 0) {
 		return err;
 	}
@@ -618,6 +687,7 @@ static void isr_rx(const struct bsr_evt *e, void *param)
 	struct node_rx_pdu *node_rx;
 	struct lll_addr_match match;
 	struct pdu_adv *pdu;
+	uint8_t rl_idx;
 	int err;
 
 	/* No PDU, or one with errors */
@@ -631,15 +701,25 @@ static void isr_rx(const struct bsr_evt *e, void *param)
 	LL_ASSERT_DBG(node_rx != NULL);
 
 	pdu = (void *)node_rx->pdu;
-	lll_addr_match(pdu, evt.filter, &match);
+	lll_addr_match(pdu, evt.filter, evt.resolve, &match);
 
-	if (!rx_filter_check(lll, match.devmatch_ok)) {
+	rl_idx = FILTER_IDX_NONE;
+	if (IS_ENABLED(CONFIG_BT_CTLR_PRIVACY)) {
+		if (match.devmatch_ok != 0U) {
+			rl_idx = ull_filter_lll_rl_idx((lll->filter_policy & SCAN_FP_FILTER) != 0U,
+						       match.devmatch_id);
+		} else if (match.irkmatch_ok != 0U) {
+			rl_idx = ull_filter_lll_rl_irk_idx(match.irkmatch_id);
+		}
+	}
+
+	if (!rx_filter_check(lll, match.irkmatch_ok, match.devmatch_ok, rl_idx)) {
 		err = -EINVAL;
 
 		goto isr_rx_do_close;
 	}
 
-	err = isr_rx_pdu(lll, e, pdu);
+	err = isr_rx_pdu(lll, e, pdu, &match, rl_idx);
 	if (err == 0) {
 		return;
 	}
@@ -696,7 +776,11 @@ static int common_prepare_cb(struct lll_prepare_param *p, bool is_resume)
 #endif /* !CONFIG_BT_CTLR_TX_PWR_DYNAMIC_CONTROL */
 
 	evt.filter = NULL;
-	if (IS_ENABLED(CONFIG_BT_CTLR_FILTER_ACCEPT_LIST) && (lll->filter_policy != 0U)) {
+	evt.resolve = false;
+	if (IS_ENABLED(CONFIG_BT_CTLR_PRIVACY) && ull_filter_lll_rl_enabled()) {
+		evt.filter = ull_filter_lll_get((lll->filter_policy & SCAN_FP_FILTER) != 0U);
+		evt.resolve = true;
+	} else if (IS_ENABLED(CONFIG_BT_CTLR_FILTER_ACCEPT_LIST) && (lll->filter_policy != 0U)) {
 		evt.filter = ull_filter_lll_get(true);
 	}
 
