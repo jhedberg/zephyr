@@ -28,6 +28,8 @@
 #include "nsi_hws_models_if.h"
 #include "nsi_utils.h"
 
+#include "bsim_board_if.h"
+#include "phy_sync_ctrl.h"
 #include "bs_2g4_radio_if.h"
 #include "bs_2g4_radio_platform.h"
 
@@ -240,10 +242,10 @@ static void abort_struct_update(struct op *op, p2G4_abort_t *abort, bs_time_t *r
 	/* Recheck next time anything in this device may decide to abort */
 	nsi_hws_find_next_event();
 	*recheck_dev = BS_MAX(nsi_hws_get_next_event_time(), now);
-	abort->recheck_time = bsr_plat_phy_time_from_dev(*recheck_dev);
+	abort->recheck_time = hwll_phy_time_from_dev(*recheck_dev);
 
 	if (op->aborted) {
-		abort->abort_time = bsr_plat_phy_time_from_dev(now);
+		abort->abort_time = hwll_phy_time_from_dev(now);
 	} else {
 		abort->abort_time = TIME_NEVER;
 	}
@@ -273,36 +275,42 @@ static void phy_op_ended(struct op *op, bs_time_t end_dev)
 	radio_timer_update();
 }
 
+static void phy_disconnected(void)
+{
+	bs_trace_raw_manual_time(3, nsi_hws_get_time(), "The phy disconnected us\n");
+	hwll_disconnect_phy_and_exit();
+}
+
 static void tx_response_handle(struct op *op, int ret)
 {
 	bs_time_t recheck;
 
 	if (ret == -1) {
-		bsr_plat_phy_disconnected();
+		phy_disconnected();
 		return;
 	}
 
 	if (ret == P2G4_MSG_ABORTREEVAL) {
-		recheck = bsr_plat_dev_time_from_phy(op->tx_req.abort.recheck_time);
-		bsr_plat_phy_synced(recheck);
+		recheck = hwll_dev_time_from_phy(op->tx_req.abort.recheck_time);
+		phy_sync_ctrl_set_last_phy_sync_time(recheck);
 		phy_wait_set(op, PHY_WAIT_REEVAL, recheck);
 		return;
 	}
 
 	/* P2G4_MSG_TX_END: end_time is the last us of the packet */
-	bs_time_t end = bsr_plat_dev_time_from_phy(op->tx_done.end_time) + 1;
+	bs_time_t end = hwll_dev_time_from_phy(op->tx_done.end_time) + 1;
 
-	bsr_plat_phy_synced(end - 1);
+	phy_sync_ctrl_set_last_phy_sync_time(end - 1);
 	op->evt.status = BSR_STATUS_OK;
 	phy_op_ended(op, end);
 }
 
 static void rx_end_handle(struct op *op)
 {
-	bs_time_t end = bsr_plat_dev_time_from_phy(op->rx_done.end_time) + 1;
+	bs_time_t end = hwll_dev_time_from_phy(op->rx_done.end_time) + 1;
 	uint8_t status;
 
-	bsr_plat_phy_synced(end - 1);
+	phy_sync_ctrl_set_last_phy_sync_time(end - 1);
 
 	switch (op->rx_done.status) {
 	case P2G4_RXSTATUS_OK:
@@ -370,22 +378,22 @@ static void rx_response_handle(struct op *op, int ret)
 	bs_time_t recheck;
 
 	if (ret == -1) {
-		bsr_plat_phy_disconnected();
+		phy_disconnected();
 		return;
 	}
 
 	if (ret == P2G4_MSG_ABORTREEVAL) {
-		recheck = bsr_plat_dev_time_from_phy(op->rx_req.abort.recheck_time);
-		bsr_plat_phy_synced(recheck);
+		recheck = hwll_dev_time_from_phy(op->rx_req.abort.recheck_time);
+		phy_sync_ctrl_set_last_phy_sync_time(recheck);
 		phy_wait_set(op, PHY_WAIT_REEVAL, recheck);
 		return;
 	}
 
 	if (ret == P2G4_MSG_RXV2_ADDRESSFOUND) {
 		/* rx_time_stamp is the last us of the access address */
-		bs_time_t aa_last = bsr_plat_dev_time_from_phy(op->rx_done.rx_time_stamp);
+		bs_time_t aa_last = hwll_dev_time_from_phy(op->rx_done.rx_time_stamp);
 
-		bsr_plat_phy_synced(aa_last);
+		phy_sync_ctrl_set_last_phy_sync_time(aa_last);
 		op->evt.ts_aa_end = (uint32_t)(aa_last + 1);
 		op->evt.ts_start = (uint32_t)(aa_last + 1 - pream_and_addr_us(op->cfg.phy));
 		phy_wait_set(op, PHY_WAIT_ADDRESS, aa_last);
@@ -419,7 +427,7 @@ static void tx_start(struct op *op)
 	req->power_level = p2G4_power_from_d(op->cfg.tx_power + cheat.tx_power_offset);
 	req->packet_size = op->pkt_len;
 	req->coding_rate = 0;
-	req->start_tx_time = bsr_plat_phy_time_from_dev(op->start);
+	req->start_tx_time = hwll_phy_time_from_dev(op->start);
 	req->start_packet_time = req->start_tx_time;
 	req->end_tx_time = req->start_tx_time + dur - 1;
 	req->end_packet_time = req->end_tx_time;
@@ -450,7 +458,7 @@ static void rx_start(struct op *op)
 
 	memset(req, 0, sizeof(*req));
 	radio_params_set(&req->radio_params, &op->cfg);
-	req->start_time = bsr_plat_phy_time_from_dev(op->start);
+	req->start_time = hwll_phy_time_from_dev(op->start);
 	/* The access address must have ended by start + window_us */
 	req->scan_duration = (op->window_us != 0U) ? (op->window_us + 1U) : UINT32_MAX;
 	req->forced_packet_duration = UINT32_MAX;
@@ -491,7 +499,7 @@ static void phy_respond(struct op *op)
 	if (wait == PHY_WAIT_ADDRESS) {
 		if (op->aborted) {
 			(void)p2G4_dev_rxv2_cont_after_addr_nc_b(false, NULL);
-			bsr_plat_phy_synced(nsi_hws_get_time());
+			phy_sync_ctrl_set_last_phy_sync_time(nsi_hws_get_time());
 			op_free(op);
 			radio_timer_update();
 			return;
