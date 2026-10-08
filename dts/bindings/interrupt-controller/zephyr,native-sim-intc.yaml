@@ -1,0 +1,22 @@
+# Copyright The Zephyr Project Contributors
+# SPDX-License-Identifier: Apache-2.0
+
+description: |
+  Interrupt controller of the native simulator.
+
+  The native_sim drivers use fixed interrupt lines, so the board does not
+  need this node, but models that take their interrupt lines from the
+  devicetree, like the BabbleSim packet level radio model, need it as their
+  interrupt parent.
+
+compatible: "zephyr,native-sim-intc"
+
+include: [interrupt-controller.yaml, base.yaml]
+
+properties:
+  "#interrupt-cells":
+    const: 2
+
+interrupt-cells:
+  - irq
+  - priority
