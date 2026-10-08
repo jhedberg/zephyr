@@ -13,6 +13,9 @@
  */
 #define LLL_CCM_HDR_MASK_ACL ((uint8_t)~(BIT(2) | BIT(3) | BIT(4)))
 
+/* NESN, SN, CIE and NPI in CIS PDUs */
+#define LLL_CCM_HDR_MASK_CIS ((uint8_t)~(BIT(2) | BIT(3) | BIT(4) | BIT(6)))
+
 /* CSSN and CSTF in BIS PDUs */
 #define LLL_CCM_HDR_MASK_BIS ((uint8_t)~(GENMASK(4, 2) | BIT(5)))
 
