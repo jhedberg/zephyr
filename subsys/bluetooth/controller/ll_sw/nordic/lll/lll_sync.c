@@ -183,59 +183,6 @@ void lll_sync_aux_prepare_cb(struct lll_sync *lll,
 	radio_switch_complete_and_disable();
 }
 
-#if defined(CONFIG_BT_CTLR_SYNC_PERIODIC_CTE_TYPE_FILTERING)
-enum sync_status lll_sync_cte_is_allowed(uint8_t cte_type_mask, uint8_t filter_policy,
-					 uint8_t rx_cte_time, uint8_t rx_cte_type)
-{
-	bool cte_ok;
-
-	if (cte_type_mask == BT_HCI_LE_PER_ADV_CREATE_SYNC_CTE_TYPE_NO_FILTERING) {
-		return SYNC_STAT_ALLOWED;
-	}
-
-	if (rx_cte_time > 0) {
-		if ((cte_type_mask & BT_HCI_LE_PER_ADV_CREATE_SYNC_CTE_TYPE_NO_CTE) != 0) {
-			cte_ok = false;
-		} else {
-			switch (rx_cte_type) {
-			case BT_HCI_LE_AOA_CTE:
-				cte_ok = !(cte_type_mask &
-					   BT_HCI_LE_PER_ADV_CREATE_SYNC_CTE_TYPE_NO_AOA);
-				break;
-			case BT_HCI_LE_AOD_CTE_1US:
-				cte_ok = !(cte_type_mask &
-					   BT_HCI_LE_PER_ADV_CREATE_SYNC_CTE_TYPE_NO_AOD_1US);
-				break;
-			case BT_HCI_LE_AOD_CTE_2US:
-				cte_ok = !(cte_type_mask &
-					   BT_HCI_LE_PER_ADV_CREATE_SYNC_CTE_TYPE_NO_AOD_2US);
-				break;
-			default:
-				/* Unknown or forbidden CTE type */
-				cte_ok = false;
-			}
-		}
-	} else {
-		/* If there is no CTEInfo in advertising PDU, Radio will not parse the S0 byte and
-		 * CTESTATUS register will hold zeros only.
-		 * Zero value in CTETime field of CTESTATUS may be used to distinguish between PDU
-		 * that includes CTEInfo or not. Allowed range for CTETime is 2-20.
-		 */
-		if ((cte_type_mask & BT_HCI_LE_PER_ADV_CREATE_SYNC_CTE_TYPE_ONLY_CTE) != 0) {
-			cte_ok = false;
-		} else {
-			cte_ok = true;
-		}
-	}
-
-	if (!cte_ok) {
-		return filter_policy ? SYNC_STAT_CONT_SCAN : SYNC_STAT_TERM;
-	}
-
-	return SYNC_STAT_ALLOWED;
-}
-#endif /* CONFIG_BT_CTLR_SYNC_PERIODIC_CTE_TYPE_FILTERING */
-
 static int init_reset(void)
 {
 	return 0;
@@ -1442,6 +1389,9 @@ static enum sync_status sync_filtrate_by_cte_type(uint8_t cte_type_mask, uint8_t
 	uint8_t rx_cte_time;
 	uint8_t rx_cte_type;
 
+	/* If there is no CTEInfo in advertising PDU, Radio will not parse the S0 byte and
+	 * CTESTATUS register will hold zeros only, i.e. a CTETime of zero.
+	 */
 	rx_cte_time = nrf_radio_cte_time_get(NRF_RADIO);
 	rx_cte_type = nrf_radio_cte_type_get(NRF_RADIO);
 
