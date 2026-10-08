@@ -26,7 +26,7 @@
 #include "babblekit/testcase.h"
 #include "babblekit/flags.h"
 #include "babblekit/sync.h"
-#include "NRF_HWLowL.h"		/* for hwll_disconnect_phy(); */
+#include "bsim_board_if.h" /* for hwll_disconnect_phy(); */
 
 #include "common.h"
 
