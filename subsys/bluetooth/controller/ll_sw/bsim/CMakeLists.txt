@@ -67,6 +67,10 @@ if(CONFIG_BT_CTLR_LE_ENC OR CONFIG_BT_CTLR_BROADCAST_ISO_ENC)
     lll/lll_ccm.c
     )
 endif()
+zephyr_library_sources_ifdef(
+  CONFIG_BT_CTLR_ISO_VENDOR_DATA_PATH
+  ull/ull_iso_vendor.c
+  )
 
 # The software AES in ecb.c is also used by the LLL for CCM and address
 # resolution.
