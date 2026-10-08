@@ -25,6 +25,8 @@
 
 #include "lll.h"
 #include "lll_clock.h"
+#include "lll/lll_df_types.h"
+#include "lll_sync.h"
 #include "lll_conn.h"
 #include "lll_scan.h"
 #include "lll_scan_aux.h"
@@ -114,6 +116,57 @@ void lll_done_score(void *param, uint8_t result)
 	}
 }
 #endif /* CONFIG_BT_CTLR_JIT_SCHEDULING */
+
+#if defined(CONFIG_BT_CTLR_SYNC_PERIODIC_CTE_TYPE_FILTERING)
+enum sync_status lll_sync_cte_is_allowed(uint8_t cte_type_mask, uint8_t filter_policy,
+					 uint8_t rx_cte_time, uint8_t rx_cte_type)
+{
+	bool cte_ok;
+
+	if (cte_type_mask == BT_HCI_LE_PER_ADV_CREATE_SYNC_CTE_TYPE_NO_FILTERING) {
+		return SYNC_STAT_ALLOWED;
+	}
+
+	if (rx_cte_time > 0) {
+		if ((cte_type_mask & BT_HCI_LE_PER_ADV_CREATE_SYNC_CTE_TYPE_NO_CTE) != 0) {
+			cte_ok = false;
+		} else {
+			switch (rx_cte_type) {
+			case BT_HCI_LE_AOA_CTE:
+				cte_ok = !(cte_type_mask &
+					   BT_HCI_LE_PER_ADV_CREATE_SYNC_CTE_TYPE_NO_AOA);
+				break;
+			case BT_HCI_LE_AOD_CTE_1US:
+				cte_ok = !(cte_type_mask &
+					   BT_HCI_LE_PER_ADV_CREATE_SYNC_CTE_TYPE_NO_AOD_1US);
+				break;
+			case BT_HCI_LE_AOD_CTE_2US:
+				cte_ok = !(cte_type_mask &
+					   BT_HCI_LE_PER_ADV_CREATE_SYNC_CTE_TYPE_NO_AOD_2US);
+				break;
+			default:
+				/* Unknown or forbidden CTE type */
+				cte_ok = false;
+			}
+		}
+	} else {
+		/* No CTEInfo in the PDU. The CTETime of a CTEInfo is in the
+		 * range 2 to 20, so 0 tells the two apart.
+		 */
+		if ((cte_type_mask & BT_HCI_LE_PER_ADV_CREATE_SYNC_CTE_TYPE_ONLY_CTE) != 0) {
+			cte_ok = false;
+		} else {
+			cte_ok = true;
+		}
+	}
+
+	if (!cte_ok) {
+		return filter_policy ? SYNC_STAT_CONT_SCAN : SYNC_STAT_TERM;
+	}
+
+	return SYNC_STAT_ALLOWED;
+}
+#endif /* CONFIG_BT_CTLR_SYNC_PERIODIC_CTE_TYPE_FILTERING */
 
 #if defined(CONFIG_BT_OBSERVER)
 bool lll_scan_isr_rx_check(const struct lll_scan *lll, uint8_t irkmatch_ok,
