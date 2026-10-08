@@ -82,6 +82,14 @@ if(CONFIG_SOC_SERIES_BSIM_NRFXX)
   target_sources(native_simulator INTERFACE
     ${ZEPHYR_BASE}/boards/native/nrf_bsim/common/bs_2g4_radio_nrf_bsim.c
     )
+  # The radio test cheats of the nRF HW models apply to this radio model
+  # (see bs_2g4_radio_nrf_bsim.c).
+  target_link_options(native_simulator INTERFACE
+    -Wl,--wrap=hw_radio_testcheat_set_tx_power_gain
+    -Wl,--wrap=hw_radio_testcheat_set_rx_power_gain
+    -Wl,--wrap=hw_radio_testcheat_disable_tx
+    -Wl,--wrap=hw_radio_testcheat_disable_rx
+    )
 endif()
 
 zephyr_library_compile_options_ifdef(
