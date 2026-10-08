@@ -18,9 +18,14 @@ if(CONFIG_BT_BROADCASTER)
   )
 endif()
 
-zephyr_library_sources_ifdef(CONFIG_BT_OBSERVER
-  "lll/lll_scan.c"
-)
+if(CONFIG_BT_OBSERVER)
+  zephyr_library_sources(
+    "lll/lll_scan.c"
+  )
+  zephyr_library_sources_ifdef(CONFIG_BT_CTLR_ADV_EXT
+    "lll/lll_scan_aux.c"
+  )
+endif()
 
 if(CONFIG_BT_CONN)
   zephyr_library_sources(
