@@ -13,6 +13,10 @@
  * answers a SCAN_REQ with the scan response tIFS after it. The next channel
  * is used as soon as the radio can switch to it. A high duty cycle directed
  * advertising event goes on cycling through the channels until it is aborted.
+ *
+ * With extended advertising, the ADV_EXT_IND sent on each channel has the
+ * offset to the AUX_ADV_IND of the auxiliary advertising event that follows
+ * (see lll_adv_aux.c), which then generates the done event of both.
  */
 
 #include <stdint.h>
@@ -45,6 +49,7 @@
 #include "lll_adv_types.h"
 #include "lll_adv.h"
 #include "lll_adv_pdu.h"
+#include "lll_adv_aux.h"
 #include "lll_df_types.h"
 #include "lll_conn.h"
 #include "lll_filter.h"
@@ -53,6 +58,7 @@
 #include "lll_tim_internal.h"
 #include "lll_radio.h"
 #include "lll_addr.h"
+#include "lll_adv_internal.h"
 
 #include "hal/debug.h"
 
@@ -69,7 +75,7 @@ static void isr_tx(const struct bsr_evt *e, void *param);
 static void isr_rx(const struct bsr_evt *e, void *param);
 static void isr_done(const struct bsr_evt *e, void *param);
 static void isr_abort(const struct bsr_evt *e, void *param);
-static void chan_tx(struct lll_adv *lll, uint32_t at);
+static struct pdu_adv *chan_tx(struct lll_adv *lll, uint32_t at);
 static int isr_rx_pdu(struct lll_adv *lll, const struct bsr_evt *e, struct pdu_adv *pdu_rx,
 		      const struct lll_addr_match *match);
 
@@ -89,12 +95,47 @@ static struct {
 
 int lll_adv_init(void)
 {
+#if defined(CONFIG_BT_CTLR_ADV_EXT) && (CONFIG_BT_CTLR_ADV_AUX_SET > 0)
+	int err;
+
+	err = lll_adv_aux_init();
+	if (err) {
+		return err;
+	}
+#endif /* CONFIG_BT_CTLR_ADV_EXT && (CONFIG_BT_CTLR_ADV_AUX_SET > 0) */
+
 	return lll_adv_pdu_init_reset();
 }
 
 int lll_adv_reset(void)
 {
+#if defined(CONFIG_BT_CTLR_ADV_EXT) && (CONFIG_BT_CTLR_ADV_AUX_SET > 0)
+	int err;
+
+	err = lll_adv_aux_reset();
+	if (err) {
+		return err;
+	}
+#endif /* CONFIG_BT_CTLR_ADV_EXT && (CONFIG_BT_CTLR_ADV_AUX_SET > 0) */
+
 	return lll_adv_pdu_init_reset();
+}
+
+void lll_adv_filter_get(const struct lll_adv *lll, const struct lll_filter **filter,
+			bool *resolve)
+{
+	*filter = NULL;
+	*resolve = false;
+
+	if (0) {
+#if defined(CONFIG_BT_CTLR_PRIVACY)
+	} else if (ull_filter_lll_rl_enabled()) {
+		*filter = ull_filter_lll_get(!!(lll->filter_policy));
+		*resolve = true;
+#endif /* CONFIG_BT_CTLR_PRIVACY */
+	} else if (IS_ENABLED(CONFIG_BT_CTLR_FILTER_ACCEPT_LIST) && lll->filter_policy) {
+		*filter = ull_filter_lll_get(true);
+	}
 }
 
 void lll_adv_prepare(void *param)
@@ -111,6 +152,7 @@ void lll_adv_prepare(void *param)
 static int prepare_cb(struct lll_prepare_param *p)
 {
 	struct lll_adv *lll = p->param;
+	struct pdu_adv *pdu;
 	uint32_t overhead;
 	uint32_t start_us;
 	int err;
@@ -137,6 +179,9 @@ static int prepare_cb(struct lll_prepare_param *p)
 		return -ECANCELED;
 	}
 
+	/* The primary channel PDUs are on the LE 1M PHY, the radio model has no
+	 * LE Coded PHY.
+	 */
 	evt.cfg.aa = PDU_AC_ACCESS_ADDR;
 	evt.cfg.crc_init = PDU_AC_CRC_IV;
 	evt.cfg.phy = BSR_PHY_1M;
@@ -147,22 +192,29 @@ static int prepare_cb(struct lll_prepare_param *p)
 	evt.cfg.tx_power = RADIO_TXP_DEFAULT;
 #endif /* !CONFIG_BT_CTLR_TX_PWR_DYNAMIC_CONTROL */
 
-	evt.filter = NULL;
-	evt.resolve = false;
-#if defined(CONFIG_BT_CTLR_PRIVACY)
-	if (ull_filter_lll_rl_enabled()) {
-		evt.filter = ull_filter_lll_get(!!(lll->filter_policy));
-		evt.resolve = true;
-	} else
-#endif /* CONFIG_BT_CTLR_PRIVACY */
-	if (IS_ENABLED(CONFIG_BT_CTLR_FILTER_ACCEPT_LIST) && lll->filter_policy) {
-		evt.filter = ull_filter_lll_get(true);
-	}
+	lll_adv_filter_get(lll, &evt.filter, &evt.resolve);
 
 	start_us = lll_event_start_get(p, &evt.ticks_ref);
 
 	lll->chan_map_curr = lll->chan_map;
-	chan_tx(lll, start_us);
+	pdu = chan_tx(lll, start_us);
+
+#if defined(CONFIG_BT_CTLR_ADV_EXT) && defined(CONFIG_BT_TICKER_EXT_EXPIRE_INFO)
+	if (lll->aux) {
+		/* Fill the AuxPtr of the first PDU, read by the radio when its
+		 * Tx starts.
+		 */
+		ull_adv_aux_lll_auxptr_fill(pdu, lll);
+
+		/* The reference of the event, from which the aux offset of the
+		 * later PDUs is calculated, is one tick before the first PDU.
+		 */
+		lll->aux->ticks_pri_pdu_offset += 1U;
+	}
+#else /* !CONFIG_BT_CTLR_ADV_EXT || !CONFIG_BT_TICKER_EXT_EXPIRE_INFO */
+	/* The ULL has filled the AuxPtr of the first PDU */
+	ARG_UNUSED(pdu);
+#endif /* !CONFIG_BT_CTLR_ADV_EXT || !CONFIG_BT_TICKER_EXT_EXPIRE_INFO */
 
 	err = lll_prepare_done(lll);
 	LL_ASSERT_ERR(!err);
@@ -239,8 +291,10 @@ static void abort_cb(struct lll_prepare_param *prepare_param, void *param)
 	lll_done(param);
 }
 
-/* Transmit the advertising PDU on the next channel of the event */
-static void chan_tx(struct lll_adv *lll, uint32_t at)
+/* Transmit the advertising PDU on the next channel of the event, and return
+ * it.
+ */
+static struct pdu_adv *chan_tx(struct lll_adv *lll, uint32_t at)
 {
 	struct pdu_adv *pdu;
 	uint8_t chan;
@@ -257,7 +311,8 @@ static void chan_tx(struct lll_adv *lll, uint32_t at)
 	pdu = lll_adv_data_latest_get(lll, &upd);
 	LL_ASSERT_DBG(pdu);
 
-	if (pdu->type != PDU_ADV_TYPE_NONCONN_IND) {
+	if ((pdu->type != PDU_ADV_TYPE_NONCONN_IND) &&
+	    (!IS_ENABLED(CONFIG_BT_CTLR_ADV_EXT) || (pdu->type != PDU_ADV_TYPE_EXT_IND))) {
 		struct pdu_adv *scan_pdu;
 
 		scan_pdu = lll_adv_scan_rsp_latest_get(lll, &upd);
@@ -275,6 +330,8 @@ static void chan_tx(struct lll_adv *lll, uint32_t at)
 	}
 
 	lll_radio_tx(&evt.cfg, at, pdu, isr_tx, lll);
+
+	return pdu;
 }
 
 /* End of the advertising PDU on a channel */
@@ -284,8 +341,12 @@ static void isr_tx(const struct bsr_evt *e, void *param)
 	struct lll_adv *lll = param;
 	struct pdu_adv *pdu;
 
+	/* No SCAN_REQ or CONNECT_IND after a non-connectable and non-scannable
+	 * PDU, nor after an ADV_EXT_IND.
+	 */
 	pdu = lll_adv_data_curr_get(lll);
-	if ((e->status != BSR_STATUS_OK) || (pdu->type == PDU_ADV_TYPE_NONCONN_IND)) {
+	if ((e->status != BSR_STATUS_OK) || (pdu->type == PDU_ADV_TYPE_NONCONN_IND) ||
+	    (IS_ENABLED(CONFIG_BT_CTLR_ADV_EXT) && (pdu->type == PDU_ADV_TYPE_EXT_IND))) {
 		isr_done(e, lll);
 		return;
 	}
@@ -346,7 +407,28 @@ static void isr_done(const struct bsr_evt *e, void *param)
 	    (!lll->conn || !lll->conn->periph.cancelled) &&
 #endif /* CONFIG_BT_PERIPHERAL */
 	    1) {
-		chan_tx(lll, lll_radio_now() + ADV_CHAN_SWITCH_US);
+		struct pdu_adv *pdu;
+		uint32_t at;
+
+		at = lll_radio_now() + ADV_CHAN_SWITCH_US;
+		pdu = chan_tx(lll, at);
+
+#if defined(CONFIG_BT_CTLR_ADV_EXT)
+		if (lll->aux) {
+			uint32_t pdu_offset_us;
+
+			/* Aux offset from this PDU, read by the radio when its
+			 * Tx starts. The PDU is at pdu_offset_us from the
+			 * reference of the event.
+			 */
+			pdu_offset_us = at - HAL_TICKER_TICKS_TO_US(evt.ticks_ref);
+			(void)ull_adv_aux_lll_offset_fill(pdu, lll->aux->ticks_pri_pdu_offset,
+							  lll->aux->us_pri_pdu_offset,
+							  pdu_offset_us);
+		}
+#else /* !CONFIG_BT_CTLR_ADV_EXT */
+		ARG_UNUSED(pdu);
+#endif /* !CONFIG_BT_CTLR_ADV_EXT */
 
 		return;
 	}
@@ -363,12 +445,21 @@ static void isr_done(const struct bsr_evt *e, void *param)
 	}
 #endif /* CONFIG_BT_CTLR_ADV_INDICATION */
 
-#if defined(CONFIG_BT_CTLR_JIT_SCHEDULING)
+#if defined(CONFIG_BT_CTLR_ADV_EXT) || defined(CONFIG_BT_CTLR_JIT_SCHEDULING)
 	struct event_done_extra *extra;
+
+#if defined(CONFIG_BT_CTLR_ADV_EXT) && !defined(CONFIG_BT_CTLR_JIT_SCHEDULING)
+	/* The auxiliary advertising event generates the done event */
+	if (lll->aux) {
+		lll_isr_cleanup(lll);
+
+		return;
+	}
+#endif /* CONFIG_BT_CTLR_ADV_EXT && !CONFIG_BT_CTLR_JIT_SCHEDULING */
 
 	extra = ull_done_extra_type_set(EVENT_DONE_EXTRA_TYPE_ADV);
 	LL_ASSERT_ERR(extra);
-#endif /* CONFIG_BT_CTLR_JIT_SCHEDULING */
+#endif /* CONFIG_BT_CTLR_ADV_EXT || CONFIG_BT_CTLR_JIT_SCHEDULING */
 
 	lll_isr_cleanup(lll);
 }
@@ -385,8 +476,8 @@ static bool isr_rx_sr_adva_check(uint8_t tx_addr, const uint8_t *addr, const str
 	return (tx_addr == sr->rx_addr) && !memcmp(addr, sr->scan_req.adv_addr, BDADDR_SIZE);
 }
 
-static bool scan_req_check(const struct lll_adv *lll, const struct pdu_adv *sr, uint8_t tx_addr,
-			   const uint8_t *addr, uint8_t devmatch_ok, uint8_t *rl_idx)
+bool lll_adv_scan_req_check(const struct lll_adv *lll, const struct pdu_adv *sr, uint8_t tx_addr,
+			    const uint8_t *addr, uint8_t devmatch_ok, uint8_t *rl_idx)
 {
 #if defined(CONFIG_BT_CTLR_PRIVACY)
 	return ((((lll->filter_policy & BT_LE_ADV_FP_FILTER_SCAN_REQ) == 0U) &&
@@ -419,9 +510,9 @@ static bool isr_rx_ci_adva_check(uint8_t tx_addr, const uint8_t *addr, const str
 	return (tx_addr == ci->rx_addr) && !memcmp(addr, ci->connect_ind.adv_addr, BDADDR_SIZE);
 }
 
-static bool connect_ind_check(const struct lll_adv *lll, const struct pdu_adv *ci,
-			      uint8_t tx_addr, const uint8_t *addr, uint8_t rx_addr,
-			      const uint8_t *tgt_addr, uint8_t devmatch_ok, uint8_t *rl_idx)
+bool lll_adv_connect_ind_check(const struct lll_adv *lll, const struct pdu_adv *ci,
+			       uint8_t tx_addr, const uint8_t *addr, uint8_t rx_addr,
+			       const uint8_t *tgt_addr, uint8_t devmatch_ok, uint8_t *rl_idx)
 {
 	/* LL 4.3.2: filter policy shall be ignored for directed adv */
 	if (tgt_addr) {
@@ -466,7 +557,7 @@ static void event_close_all(struct lll_adv *lll)
 #endif /* CONFIG_BT_PERIPHERAL */
 
 #if defined(CONFIG_BT_CTLR_SCAN_REQ_NOTIFY)
-static int scan_req_report(struct lll_adv *lll, const struct bsr_evt *e, uint8_t rl_idx)
+int lll_adv_scan_req_report(struct lll_adv *lll, const struct bsr_evt *e, uint8_t rl_idx)
 {
 	struct node_rx_pdu *node_rx;
 
@@ -525,14 +616,21 @@ static int isr_rx_pdu(struct lll_adv *lll, const struct bsr_evt *e, struct pdu_a
 
 	if ((pdu_rx->type == PDU_ADV_TYPE_SCAN_REQ) &&
 	    (pdu_rx->len == sizeof(struct pdu_adv_scan_req)) && (tgt_addr == NULL) &&
-	    scan_req_check(lll, pdu_rx, tx_addr, addr, match->devmatch_ok, &rl_idx)) {
+	    lll_adv_scan_req_check(lll, pdu_rx, tx_addr, addr, match->devmatch_ok, &rl_idx)) {
 #if defined(CONFIG_BT_CTLR_SCAN_REQ_NOTIFY)
-		int err;
+		/* With extended advertising, only reported when enabled for the
+		 * advertising set.
+		 */
+		if (!IS_ENABLED(CONFIG_BT_CTLR_ADV_EXT) || lll->scan_req_notify) {
+			int err;
 
-		/* Without a report, the scan response is not transmitted */
-		err = scan_req_report(lll, e, rl_idx);
-		if (err) {
-			return err;
+			/* Without a report, the scan response is not
+			 * transmitted.
+			 */
+			err = lll_adv_scan_req_report(lll, e, rl_idx);
+			if (err) {
+				return err;
+			}
 		}
 #endif /* CONFIG_BT_CTLR_SCAN_REQ_NOTIFY */
 
@@ -555,8 +653,8 @@ static int isr_rx_pdu(struct lll_adv *lll, const struct bsr_evt *e, struct pdu_a
 	} else if ((pdu_rx->type == PDU_ADV_TYPE_CONNECT_IND) &&
 		   (pdu_rx->len == sizeof(struct pdu_adv_connect_ind)) && lll->conn &&
 		   !lll->conn->periph.cancelled &&
-		   connect_ind_check(lll, pdu_rx, tx_addr, addr, rx_addr, tgt_addr,
-				     match->devmatch_ok, &rl_idx)) {
+		   lll_adv_connect_ind_check(lll, pdu_rx, tx_addr, addr, rx_addr, tgt_addr,
+					     match->devmatch_ok, &rl_idx)) {
 		struct node_rx_ftr *ftr;
 		struct node_rx_pdu *rx;
 
