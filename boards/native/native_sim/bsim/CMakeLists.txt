@@ -5,13 +5,16 @@ add_subdirectory("${ZEPHYR_BASE}/boards/native/common/bsim"
   "${CMAKE_CURRENT_BINARY_DIR}/common_bsim"
 )
 
-# The radio model uses the Bluetooth LE CRC of the nRF HW models, which is not
-# specific to the nRF SoCs. Their interrupt controller has the same header
-# name as the one of the native simulator, which is found first.
+# The nRF HW models have the connection to the Phy, a clock drift model, the
+# Bluetooth LE CRC, and the interfaces of the test ticker and test cheats that
+# the bsim tests use, none of which are specific to the nRF SoCs. Their
+# interrupt controller has the same header name as the one of the native
+# simulator, which is found first.
 set(hw_models_dir "${ZEPHYR_NRF_HW_MODELS_MODULE_DIR}/src/HW_models")
 
 zephyr_include_directories(
   "."
+  "${hw_models_dir}"
 )
 
 # The BabbleSim boards parse the command line and trace with BabbleSim, so
@@ -22,6 +25,8 @@ target_sources(native_simulator INTERFACE
   "${NSI_DIR}/native/src/irq_ctrl.c"
   "${NSI_DIR}/native/src/native_rtc.c"
   "${NSI_DIR}/native/src/timer_model.c"
+  "${hw_models_dir}/NRF_HWLowL.c"
+  "${hw_models_dir}/trivial_xo.c"
   "bsim_board_native_sim.c"
   "bstest_ticker.c"
   "cmdline_runner.c"
