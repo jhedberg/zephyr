@@ -272,6 +272,15 @@ void lll_event_abort(void *param)
 	lll_radio_stop(isr_event_abort, param);
 }
 
+int lll_is_abort_cb(void *next, void *curr, lll_prepare_cb_t *resume_cb)
+{
+	ARG_UNUSED(next);
+	ARG_UNUSED(curr);
+	ARG_UNUSED(resume_cb);
+
+	return -ECANCELED;
+}
+
 void lll_abort_cb(struct lll_prepare_param *prepare_param, void *param)
 {
 	int err;
