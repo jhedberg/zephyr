@@ -26,6 +26,7 @@
 #include <zephyr/toolchain.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/util.h>
+#include <zephyr/bluetooth/hci_types.h>
 
 #include "hal/ccm.h"
 #include "hal/radio.h"
