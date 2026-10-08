@@ -463,21 +463,22 @@ static void isr_rx(const struct bsr_evt *e, void *param)
 	if (evt.trx_cnt == 1U) {
 		/* First packet of the event, as anchor point */
 		evt.aa_end = e->ts_aa_end;
+	}
 
 #if defined(CONFIG_BT_CTLR_CONN_RSSI)
-		lll->rssi_latest = lll_rssi_get(e->rssi);
+	/* RSSI of the latest packet received */
+	lll->rssi_latest = lll_rssi_get(e->rssi);
 
 #if defined(CONFIG_BT_CTLR_CONN_RSSI_EVENT)
-		if (((lll->rssi_reported - lll->rssi_latest) & 0xFF) > LLL_CONN_RSSI_THRESHOLD) {
-			if (lll->rssi_sample_count) {
-				lll->rssi_sample_count--;
-			}
-		} else {
-			lll->rssi_sample_count = LLL_CONN_RSSI_SAMPLE_COUNT;
+	if (((lll->rssi_reported - lll->rssi_latest) & 0xFF) > LLL_CONN_RSSI_THRESHOLD) {
+		if (lll->rssi_sample_count) {
+			lll->rssi_sample_count--;
 		}
+	} else {
+		lll->rssi_sample_count = LLL_CONN_RSSI_SAMPLE_COUNT;
+	}
 #endif /* CONFIG_BT_CTLR_CONN_RSSI_EVENT */
 #endif /* CONFIG_BT_CTLR_CONN_RSSI */
-	}
 
 	is_done = 0U;
 	is_closed = false;
