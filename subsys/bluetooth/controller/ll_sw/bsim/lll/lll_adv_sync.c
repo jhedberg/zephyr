@@ -100,6 +100,7 @@ static bool is_instant_or_past(uint16_t event_counter, uint16_t instant)
 	return instant_latency <= EVENT_INSTANT_LATENCY_MAX;
 }
 
+#if defined(CONFIG_BT_CTLR_ADV_SYNC_PDU_BACK2BACK)
 /* AuxPtr of a periodic advertising PDU, NULL if it has none */
 static struct pdu_adv_aux_ptr *aux_ptr_get(struct pdu_adv *pdu)
 {
@@ -122,6 +123,7 @@ static struct pdu_adv_aux_ptr *aux_ptr_get(struct pdu_adv *pdu)
 
 	return (void *)dptr;
 }
+#endif /* CONFIG_BT_CTLR_ADV_SYNC_PDU_BACK2BACK */
 
 static int prepare_cb(struct lll_prepare_param *p)
 {
