@@ -11,6 +11,10 @@ int lll_scan_aux_init(void);
 int lll_scan_aux_reset(void);
 void lll_scan_aux_prepare(void *param);
 
+bool lll_scan_aux_connect_rsp_check(const struct lll_scan *lll,
+				    const struct pdu_adv *pdu_tx,
+				    const struct pdu_adv *pdu_rx, uint8_t rl_idx);
+
 extern uint8_t ull_scan_aux_lll_handle_get(struct lll_scan_aux *lll);
 extern void *ull_scan_aux_lll_parent_get(struct lll_scan_aux *lll,
 					 uint8_t *is_lll_scan);
