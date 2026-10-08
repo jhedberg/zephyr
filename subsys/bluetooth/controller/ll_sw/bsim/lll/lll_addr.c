@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <limits.h>
+#include <stddef.h>
 
 #include <zephyr/sys/util.h>
 #include <zephyr/bluetooth/addr.h>
@@ -40,32 +41,20 @@ static bool rpa_irk_matches(const uint8_t *irk, const uint8_t *addr)
 }
 #endif /* CONFIG_BT_CTLR_PRIVACY */
 
-void lll_addr_match(const struct pdu_adv *pdu, const struct lll_filter *filter, bool resolve,
-		    struct lll_addr_match *match)
+static void addr_match(uint8_t addr_type, const uint8_t *addr, const struct lll_filter *filter,
+		       bool resolve, struct lll_addr_match *match)
 {
-	const uint8_t *addr = pdu->payload;
-
-	match->devmatch_ok = 0U;
-	match->devmatch_id = FILTER_IDX_NONE;
-	match->irkmatch_ok = 0U;
-	match->irkmatch_id = FILTER_IDX_NONE;
-
-	if (pdu->len < BDADDR_SIZE) {
-		return;
-	}
-
 #if defined(CONFIG_BT_CTLR_FILTER_ACCEPT_LIST)
 	if (filter) {
-		match->devmatch_ok = ull_filter_lll_fal_match(filter, pdu->tx_addr, addr,
+		match->devmatch_ok = ull_filter_lll_fal_match(filter, addr_type, addr,
 							      &match->devmatch_id);
 	}
 #else /* !CONFIG_BT_CTLR_FILTER_ACCEPT_LIST */
 	ARG_UNUSED(filter);
-	ARG_UNUSED(addr);
 #endif /* !CONFIG_BT_CTLR_FILTER_ACCEPT_LIST */
 
 #if defined(CONFIG_BT_CTLR_PRIVACY)
-	if (resolve && pdu->tx_addr && ((addr[5] & 0xC0) == 0x40)) {
+	if (resolve && addr_type && ((addr[5] & 0xC0) == 0x40)) {
 		const uint8_t (*irks)[IRK_SIZE];
 		uint8_t count;
 
@@ -81,4 +70,50 @@ void lll_addr_match(const struct pdu_adv *pdu, const struct lll_filter *filter, 
 #else /* !CONFIG_BT_CTLR_PRIVACY */
 	ARG_UNUSED(resolve);
 #endif /* !CONFIG_BT_CTLR_PRIVACY */
+
+#if !defined(CONFIG_BT_CTLR_FILTER_ACCEPT_LIST) && !defined(CONFIG_BT_CTLR_PRIVACY)
+	ARG_UNUSED(addr_type);
+	ARG_UNUSED(addr);
+#endif /* !CONFIG_BT_CTLR_FILTER_ACCEPT_LIST && !CONFIG_BT_CTLR_PRIVACY */
 }
+
+static void match_init(struct lll_addr_match *match)
+{
+	match->devmatch_ok = 0U;
+	match->devmatch_id = FILTER_IDX_NONE;
+	match->irkmatch_ok = 0U;
+	match->irkmatch_id = FILTER_IDX_NONE;
+}
+
+void lll_addr_match(const struct pdu_adv *pdu, const struct lll_filter *filter, bool resolve,
+		    struct lll_addr_match *match)
+{
+	match_init(match);
+
+	if (pdu->len < BDADDR_SIZE) {
+		return;
+	}
+
+	addr_match(pdu->tx_addr, pdu->payload, filter, resolve, match);
+}
+
+#if defined(CONFIG_BT_CTLR_ADV_EXT)
+bool lll_addr_match_ext(const struct pdu_adv *pdu, const struct lll_filter *filter, bool resolve,
+			struct lll_addr_match *match)
+{
+	const struct pdu_adv_com_ext_adv *com_hdr = &pdu->adv_ext_ind;
+
+	match_init(match);
+
+	if ((pdu->len < (PDU_AC_EXT_HEADER_SIZE_MIN + sizeof(struct pdu_adv_ext_hdr) +
+			 ADVA_SIZE)) ||
+	    (com_hdr->ext_hdr_len < (sizeof(struct pdu_adv_ext_hdr) + ADVA_SIZE)) ||
+	    !com_hdr->ext_hdr.adv_addr) {
+		return false;
+	}
+
+	addr_match(pdu->tx_addr, &com_hdr->ext_hdr.data[ADVA_OFFSET], filter, resolve, match);
+
+	return true;
+}
+#endif /* CONFIG_BT_CTLR_ADV_EXT */
