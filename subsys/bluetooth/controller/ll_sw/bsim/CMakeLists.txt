@@ -34,6 +34,11 @@ if(CONFIG_BT_CONN)
   )
 endif()
 
+zephyr_library_sources_ifdef(CONFIG_BT_CTLR_LE_ENC
+  "lll/lll_ccm.c"
+)
+
+# The LLL uses the software AES of ecb.c for CCM too
 zephyr_library_sources(
   "hal/bsim/cntr.c"
   "hal/bsim/ecb.c"
