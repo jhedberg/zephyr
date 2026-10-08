@@ -20,11 +20,6 @@
 
 #include "lll_ccm.h"
 
-/* The header bits that change on a retransmission, NESN, SN and MD, are not
- * authenticated.
- */
-#define CCM_HDR_MASK ((uint8_t)~(BIT(2) | BIT(3) | BIT(4)))
-
 /* Flags of the B0 block: Adata, a 4 octet MIC (M' = 1) and a 2 octet length
  * (L' = 1), and of the A blocks: L' = 1 (RFC 3610).
  */
@@ -61,7 +56,7 @@ static void ccm_ctr(const struct ccm *ccm, const uint8_t nonce[13], uint8_t *pay
 	}
 }
 
-static void ccm_mic(const struct ccm *ccm, const uint8_t nonce[13], uint8_t hdr,
+static void ccm_mic(const struct ccm *ccm, const uint8_t nonce[13], uint8_t aad,
 		    const uint8_t *payload, uint8_t len, uint8_t mic[PDU_MIC_SIZE])
 {
 	uint8_t blk[16];
@@ -76,7 +71,7 @@ static void ccm_mic(const struct ccm *ccm, const uint8_t nonce[13], uint8_t hdr,
 	/* B1: the masked header is the additional authenticated data */
 	(void)memset(blk, 0, sizeof(blk));
 	sys_put_be16(1U, &blk[0]);
-	blk[2] = hdr & CCM_HDR_MASK;
+	blk[2] = aad;
 	block_xor(x, blk, 16U);
 	ecb_encrypt_be(ccm->key, x, x);
 
@@ -95,10 +90,10 @@ static void ccm_mic(const struct ccm *ccm, const uint8_t nonce[13], uint8_t hdr,
 	}
 }
 
-void lll_ccm_encrypt(const struct ccm *ccm, const struct pdu_data *pdu, struct pdu_data *out)
+void lll_ccm_encrypt(const struct ccm *ccm, uint8_t hdr_mask, const void *pdu, void *out)
 {
-	const uint8_t *in = (const uint8_t *)pdu;
-	uint8_t *o = (uint8_t *)out;
+	const uint8_t *in = pdu;
+	uint8_t *o = out;
 	uint8_t len = in[1];
 	uint8_t nonce[13];
 
@@ -111,15 +106,15 @@ void lll_ccm_encrypt(const struct ccm *ccm, const struct pdu_data *pdu, struct p
 	}
 
 	ccm_nonce(ccm, nonce);
-	ccm_mic(ccm, nonce, in[0], &in[2], len, &o[2U + len]);
+	ccm_mic(ccm, nonce, in[0] & hdr_mask, &in[2], len, &o[2U + len]);
 	ccm_ctr(ccm, nonce, &o[2], len);
 	o[1] = len + PDU_MIC_SIZE;
 }
 
-bool lll_ccm_decrypt(const struct ccm *ccm, const struct pdu_data *pdu, struct pdu_data *out)
+bool lll_ccm_decrypt(const struct ccm *ccm, uint8_t hdr_mask, const void *pdu, void *out)
 {
-	const uint8_t *in = (const uint8_t *)pdu;
-	uint8_t *o = (uint8_t *)out;
+	const uint8_t *in = pdu;
+	uint8_t *o = out;
 	uint8_t mic[PDU_MIC_SIZE];
 	uint8_t nonce[13];
 	uint8_t len;
@@ -142,7 +137,7 @@ bool lll_ccm_decrypt(const struct ccm *ccm, const struct pdu_data *pdu, struct p
 
 	ccm_nonce(ccm, nonce);
 	ccm_ctr(ccm, nonce, &o[2], len);
-	ccm_mic(ccm, nonce, in[0], &o[2], len, mic);
+	ccm_mic(ccm, nonce, in[0] & hdr_mask, &o[2], len, mic);
 
 	return memcmp(mic, &in[2U + len], PDU_MIC_SIZE) == 0;
 }

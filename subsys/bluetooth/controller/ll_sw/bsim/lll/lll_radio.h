@@ -11,6 +11,8 @@
  * delay: the times here and in the events are on air times.
  */
 
+#include <zephyr/sys/clock.h>
+
 #include "bs_2g4_radio_if.h"
 
 /* An operation that is stopped, or that is requested too late to start, ends
@@ -66,4 +68,23 @@ static inline uint32_t lll_radio_tifs_rx_start(uint32_t tx_end_us, uint16_t tifs
 static inline uint32_t lll_radio_tifs_rx_window(uint8_t phy)
 {
 	return (EVENT_CLOCK_JITTER_US << 1) + RANGE_DELAY_US + addr_us_get(phy);
+}
+
+/* Active clock accuracy (Core Spec Vol 6, Part B, Section 4.2.1) */
+#define LLL_RADIO_ACTIVE_CLOCK_PPM 50U
+
+/* A subevent of an isochronous event is listened for around the time that the
+ * last PDU received in the event gives, se_count subevents and elapsed_us
+ * later: for the drift of the active clocks of both sides since then, and for
+ * the jitter of both PDUs once per subevent, as a transmitter may time each
+ * subevent from the previous one. Up to half the minimum gap between
+ * subevents.
+ */
+static inline uint32_t lll_radio_se_jitter_get(uint16_t se_count, uint32_t elapsed_us)
+{
+	uint32_t drift_us;
+
+	drift_us = DIV_ROUND_UP(elapsed_us * (LLL_RADIO_ACTIVE_CLOCK_PPM << 1), USEC_PER_SEC);
+
+	return MIN(((EVENT_CLOCK_JITTER_US << 1) * se_count) + drift_us, EVENT_IFS_US >> 1);
 }

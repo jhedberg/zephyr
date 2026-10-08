@@ -40,6 +40,23 @@ void lll_abort_cb(struct lll_prepare_param *prepare_param, void *param);
 /* End the current radio event now, from a radio ISR callback */
 void lll_isr_cleanup(void *param);
 
+/* Offset from the first payload of the event of the payload sent in subevent
+ * se of a BIS. The first IRC x BN subevents send the BN payloads of the event
+ * IRC times, and each next group of BN subevents the payloads of the event
+ * PTO events further ahead (pre-transmissions).
+ */
+static inline uint16_t lll_big_payload_offset(uint8_t bn, uint8_t irc, uint8_t pto, uint8_t se)
+{
+	uint8_t group = se / bn;
+	uint8_t n = se % bn;
+
+	if (group < irc) {
+		return n;
+	}
+
+	return ((group - irc + 1U) * pto * bn) + n;
+}
+
 /* RSSI of a received packet, as the positive magnitude in dBm that the ULL
  * and HCI expect.
  */
