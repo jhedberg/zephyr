@@ -20,8 +20,8 @@
  *
  * Until a PDU has been received in the event, a subevent is listened for in
  * a window widened by the drift of the sleep clocks since the last anchor
- * point received, then for the active clock jitter around the time that
- * PDU gives.
+ * point received, then around the time that the last PDU received gives,
+ * for the active clock jitter of each subevent since that PDU.
  *
  * The event that establishes the synchronization only listens for the first
  * subevent of the first selected BIS.
@@ -80,9 +80,13 @@ struct bis_chan {
 };
 
 /* Subevent window, around its expected access address, once a PDU has been
- * received in the event.
+ * received in the event: the active clock jitter for each subevent since the
+ * last PDU received, as transmitters that time each subevent from the end of
+ * the previous one can drift a little at each, up to half the minimum gap
+ * between subevents.
  */
-#define SE_JITTER_US (EVENT_CLOCK_JITTER_US << 1)
+#define SE_JITTER_US     (EVENT_CLOCK_JITTER_US << 1)
+#define SE_JITTER_MAX_US (EVENT_IFS_US >> 1)
 
 /* State of the current BIG event */
 static struct {
@@ -99,6 +103,14 @@ static struct {
 	 * the first PDU received in the event.
 	 */
 	uint32_t aa_end;
+
+	/* End of the access address of the last PDU received in the event, the
+	 * offset of its subevent, and the position of its subevent in time
+	 * among all the subevents of the BIG.
+	 */
+	uint32_t last_aa_end;
+	uint32_t last_offset_us;
+	uint16_t last_idx;
 
 	/* Offset from the BIG anchor point that the ULL gave the event start,
 	 * the one of the first selected BIS.
@@ -273,6 +285,22 @@ static uint32_t se_offset_get(const struct lll_sync_iso *lll)
 	return offset - evt.first_us;
 }
 
+/* Position in time of the current subevent among all the subevents of the
+ * BIG.
+ */
+static uint16_t se_idx_get(const struct lll_sync_iso *lll)
+{
+	if (!evt.bis) {
+		return lll->num_bis * lll->nse;
+	}
+
+	if (is_sequential(lll)) {
+		return ((evt.bis - 1U) * lll->nse) + evt.se;
+	}
+
+	return (evt.se * lll->num_bis) + (evt.bis - 1U);
+}
+
 /* Channel of the current BIS subevent. The channel selection of a BIS moves
  * along its subevents, whether they are listened for or not.
  */
@@ -345,9 +373,14 @@ static void se_rx(struct lll_sync_iso *lll)
 
 	offset_us = se_offset_get(lll);
 	if (evt.trx_cnt) {
-		/* Around the time that the PDU received gives */
-		start_us = evt.aa_end + offset_us - addr_us_get(lll->phy) - SE_JITTER_US;
-		window_us = (SE_JITTER_US << 1) + RANGE_DELAY_US + addr_us_get(lll->phy);
+		uint32_t jitter_us;
+
+		/* Around the time that the last PDU received gives */
+		jitter_us = MIN(SE_JITTER_US * (se_idx_get(lll) - evt.last_idx),
+				SE_JITTER_MAX_US);
+		start_us = evt.last_aa_end + (offset_us - evt.last_offset_us) -
+			   addr_us_get(lll->phy) - jitter_us;
+		window_us = (jitter_us << 1) + RANGE_DELAY_US + addr_us_get(lll->phy);
 	} else {
 		start_us = evt.rx_start + offset_us;
 		window_us = evt.window_us;
@@ -699,12 +732,16 @@ static void isr_rx(const struct bsr_evt *e, void *param)
 	struct lll_sync_iso *lll = param;
 
 	if ((e->status == BSR_STATUS_OK) || (e->status == BSR_STATUS_CRC_ERR)) {
-		/* The first PDU received times the next subevents and gives
-		 * the drift of the anchor point.
+		/* The first PDU received gives the drift of the anchor point,
+		 * and the last one times the next subevents.
 		 */
 		if (!evt.trx_cnt) {
 			evt.aa_end = e->ts_aa_end - se_offset_get(lll);
 		}
+
+		evt.last_aa_end = e->ts_aa_end;
+		evt.last_offset_us = se_offset_get(lll);
+		evt.last_idx = se_idx_get(lll);
 
 		evt.trx_cnt++;
 
