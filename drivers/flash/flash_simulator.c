@@ -30,6 +30,9 @@
 
 /* For backward compatibility, default file name for instance 0 is "flash.bin" */
 #define DEFAULT_FLASH_FILE_PATH(n) COND_CODE_0(n, ("flash.bin"), ("flash" #n ".bin"))
+#define DEFAULT_FLASH_STORAGE(n)                                                                   \
+	COND_CODE_1(CONFIG_FLASH_SIMULATOR_IN_RAM_BY_DEFAULT, ("none, it is kept in RAM"),         \
+		    ("\"" DEFAULT_FLASH_FILE_PATH(n) "\""))
 
 #endif /* CONFIG_ARCH_POSIX */
 
@@ -439,7 +442,11 @@ static int flash_mock_init(const struct device *dev)
 	struct flash_simulator_data *dev_data = dev->data;
 
 	if (dev_data->flash_in_ram == false && dev_data->flash_file_path == NULL) {
-		dev_data->flash_file_path = cfg->flash_file_default_path;
+		if (IS_ENABLED(CONFIG_FLASH_SIMULATOR_IN_RAM_BY_DEFAULT)) {
+			dev_data->flash_in_ram = true;
+		} else {
+			dev_data->flash_file_path = cfg->flash_file_default_path;
+		}
 	}
 
 	rc = flash_mock_init_native(dev_data->flash_in_ram, &dev_data->mock_flash, cfg->flash_size,
@@ -659,7 +666,7 @@ static void flash_native_cleanup(void)
 		.type = 's',                                                                       \
 		.dest = (void *)&flash_simulator_data_##n.flash_file_path,                         \
 		.descript = "Path to binary file to be used as flash by " INST_NAME                \
-		     ", by default \"" DEFAULT_FLASH_FILE_PATH(n) "\""                             \
+		     ", by default " DEFAULT_FLASH_STORAGE(n)                                      \
 	},                                                                                         \
 	{                                                                                          \
 		.option = INST_NAME "_erase",                                                      \
