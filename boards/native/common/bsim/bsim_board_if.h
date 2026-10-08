@@ -38,6 +38,13 @@ void hwll_sync_time_with_phy(bs_time_t d_t);
 /* Wait until the Phy reaches Phy time <phy_time> */
 void hwll_wait_for_phy_simu_time(bs_time_t phy_time);
 
+/* Convert a device time into a Phy time, and back */
+bs_time_t hwll_phy_time_from_dev(bs_time_t d_t);
+bs_time_t hwll_dev_time_from_phy(bs_time_t p_t);
+
+/* Leave the simulation, and exit */
+void hwll_disconnect_phy_and_exit(void);
+
 /* Phy time at which the device time starts, in microseconds */
 void bsim_board_start_offset_set(double offset_us);
 
