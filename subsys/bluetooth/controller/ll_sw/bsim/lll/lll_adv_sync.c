@@ -35,6 +35,7 @@
 #include "lll_adv.h"
 #include "lll_adv_pdu.h"
 #include "lll_adv_sync.h"
+#include "lll_adv_iso.h"
 
 #include "lll_internal.h"
 #include "lll_tim_internal.h"
@@ -203,6 +204,15 @@ static int prepare_cb(struct lll_prepare_param *p)
 	upd = 0U;
 	pdu = lll_adv_sync_data_latest_get(lll, NULL, &upd);
 	LL_ASSERT_DBG(pdu != NULL);
+
+#if defined(CONFIG_BT_CTLR_ADV_ISO) && defined(CONFIG_BT_TICKER_EXT_EXPIRE_INFO)
+	/* With the expiry information of the BIG ticker, the LLL fills in the
+	 * BIGInfo rather than the ULL.
+	 */
+	if (lll->iso != NULL) {
+		ull_adv_iso_lll_biginfo_fill(pdu, lll);
+	}
+#endif /* CONFIG_BT_CTLR_ADV_ISO && CONFIG_BT_TICKER_EXT_EXPIRE_INFO */
 
 	if (lll_preempt_calc(p) != 0U) {
 		lll_event_abort(lll);
