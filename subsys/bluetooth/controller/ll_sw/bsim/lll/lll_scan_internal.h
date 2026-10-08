@@ -11,8 +11,6 @@
 void lll_scan_filter_get(const struct lll_scan *lll, const struct lll_filter **filter,
 			 bool *resolve);
 uint8_t lll_scan_rl_idx_get(const struct lll_scan *lll, const struct lll_addr_match *match);
-bool lll_scan_isr_rx_check(const struct lll_scan *lll, uint8_t irkmatch_ok, uint8_t devmatch_ok,
-			   uint8_t rl_idx);
 bool lll_scan_is_stopped(const struct lll_scan *lll);
 
 /* The backoff of the scan requests applies to AUX_SCAN_REQ and AUX_CONNECT_REQ
@@ -20,6 +18,14 @@ bool lll_scan_is_stopped(const struct lll_scan *lll);
  */
 bool lll_scan_backoff_is_req(void);
 void lll_scan_backoff_result(bool is_rsp);
+
+/* While a periodic advertising sync is being created, the ULL looks for the
+ * periodic advertiser in the PDUs that the filter policy rejects too. Those are
+ * then received, with devmatch_ok set to whether the PDU is reported. Returns
+ * false if the PDU is dropped.
+ */
+bool lll_scan_isr_rx_filter(const struct lll_scan *lll, struct lll_addr_match *match,
+			    uint8_t rl_idx);
 
 /* For an initiator that does not use the Filter Accept List */
 bool lll_scan_adva_check(const struct lll_scan *lll, uint8_t addr_type, const uint8_t *addr,
@@ -58,3 +64,17 @@ void lll_scan_isr_aux_release(struct lll_scan *lll);
 bool lll_scan_aux_setup(struct lll_scan *lll, struct lll_scan_aux *lll_aux,
 			const struct pdu_adv *pdu, uint8_t phy, uint32_t pdu_start_us,
 			uint32_t ticks_ref);
+
+struct lll_scan_aux_rx {
+	uint32_t start;
+	uint32_t window_us;
+	uint8_t phy;
+	uint8_t chan;
+};
+
+/* For the periodic sync, which receives such an auxiliary PDU itself. phy and
+ * rx->phy are PHY_1M or PHY_2M. Returns false if the PDU has no valid AuxPtr,
+ * or if the ULL can schedule the reception.
+ */
+bool lll_scan_aux_rx_get(const struct pdu_adv *pdu, uint8_t phy, uint32_t pdu_start_us,
+			 struct lll_scan_aux_rx *rx);

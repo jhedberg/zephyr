@@ -191,8 +191,8 @@ uint8_t lll_scan_rl_idx_get(const struct lll_scan *lll, const struct lll_addr_ma
 	return FILTER_IDX_NONE;
 }
 
-bool lll_scan_isr_rx_check(const struct lll_scan *lll, uint8_t irkmatch_ok, uint8_t devmatch_ok,
-			   uint8_t rl_idx)
+static bool isr_rx_check(const struct lll_scan *lll, uint8_t irkmatch_ok, uint8_t devmatch_ok,
+			 uint8_t rl_idx)
 {
 	if ((lll->filter_policy & SCAN_FP_FILTER) == 0U) {
 		return !IS_ENABLED(CONFIG_BT_CTLR_PRIVACY) || (devmatch_ok == 0U) ||
@@ -201,6 +201,22 @@ bool lll_scan_isr_rx_check(const struct lll_scan *lll, uint8_t irkmatch_ok, uint
 
 	return (devmatch_ok != 0U) ||
 	       (IS_ENABLED(CONFIG_BT_CTLR_PRIVACY) && ull_filter_lll_irk_in_fal(rl_idx));
+}
+
+bool lll_scan_isr_rx_filter(const struct lll_scan *lll, struct lll_addr_match *match,
+			    uint8_t rl_idx)
+{
+	bool allow;
+
+	allow = isr_rx_check(lll, match->irkmatch_ok, match->devmatch_ok, rl_idx);
+
+#if defined(CONFIG_BT_CTLR_SYNC_PERIODIC) && defined(CONFIG_BT_CTLR_FILTER_ACCEPT_LIST)
+	match->devmatch_ok = allow;
+
+	return allow || (lll->is_sync != 0U);
+#else /* !CONFIG_BT_CTLR_SYNC_PERIODIC || !CONFIG_BT_CTLR_FILTER_ACCEPT_LIST */
+	return allow;
+#endif /* !CONFIG_BT_CTLR_SYNC_PERIODIC || !CONFIG_BT_CTLR_FILTER_ACCEPT_LIST */
 }
 
 void lll_scan_prepare_scan_req(const struct lll_scan *lll, struct pdu_adv *pdu_tx,
@@ -530,8 +546,8 @@ bool lll_scan_ext_tgta_check(const struct lll_scan *lll, bool pri, bool is_init,
 }
 #endif /* CONFIG_BT_CTLR_ADV_EXT */
 
-static int isr_rx_scan_report(struct lll_scan *lll, const struct bsr_evt *e, uint8_t irkmatch_ok,
-			      uint8_t rl_idx, bool dir_report)
+static int isr_rx_scan_report(struct lll_scan *lll, const struct bsr_evt *e,
+			      const struct lll_addr_match *match, uint8_t rl_idx, bool dir_report)
 {
 	struct node_rx_pdu *node_rx;
 	int err = 0;
@@ -583,12 +599,11 @@ static int isr_rx_scan_report(struct lll_scan *lll, const struct bsr_evt *e, uin
 	node_rx->rx_ftr.rssi = lll_rssi_get(e->rssi);
 
 #if defined(CONFIG_BT_CTLR_PRIVACY)
-	node_rx->rx_ftr.rl_idx = (irkmatch_ok != 0U) ? rl_idx : FILTER_IDX_NONE;
+	node_rx->rx_ftr.rl_idx = (match->irkmatch_ok != 0U) ? rl_idx : FILTER_IDX_NONE;
 #if defined(CONFIG_BT_CTLR_ADV_EXT)
 	node_rx->rx_ftr.direct_resolved = (rl_idx != FILTER_IDX_NONE);
 #endif /* CONFIG_BT_CTLR_ADV_EXT */
 #else /* !CONFIG_BT_CTLR_PRIVACY */
-	ARG_UNUSED(irkmatch_ok);
 	ARG_UNUSED(rl_idx);
 #endif /* !CONFIG_BT_CTLR_PRIVACY */
 
@@ -597,6 +612,13 @@ static int isr_rx_scan_report(struct lll_scan *lll, const struct bsr_evt *e, uin
 #else /* !CONFIG_BT_CTLR_EXT_SCAN_FP */
 	ARG_UNUSED(dir_report);
 #endif /* !CONFIG_BT_CTLR_EXT_SCAN_FP */
+
+#if defined(CONFIG_BT_CTLR_SYNC_PERIODIC) && defined(CONFIG_BT_CTLR_FILTER_ACCEPT_LIST)
+	/* Not reported if only received for the sync being created */
+	node_rx->rx_ftr.devmatch = match->devmatch_ok;
+#elif !defined(CONFIG_BT_CTLR_PRIVACY)
+	ARG_UNUSED(match);
+#endif /* CONFIG_BT_CTLR_SYNC_PERIODIC && CONFIG_BT_CTLR_FILTER_ACCEPT_LIST */
 
 	ull_rx_put_sched(node_rx->hdr.link, node_rx);
 
@@ -838,7 +860,7 @@ static int isr_rx_scan_req(struct lll_scan *lll, const struct bsr_evt *e,
 {
 	int err;
 
-	err = isr_rx_scan_report(lll, e, match->irkmatch_ok, rl_idx, false);
+	err = isr_rx_scan_report(lll, e, match, rl_idx, false);
 	if (err != 0) {
 		return err;
 	}
@@ -913,7 +935,7 @@ static int isr_rx_pdu(struct lll_scan *lll, const struct bsr_evt *e, struct pdu_
 		return -EINVAL;
 	}
 
-	err = isr_rx_scan_report(lll, e, match->irkmatch_ok, rl_idx, dir_report);
+	err = isr_rx_scan_report(lll, e, match, rl_idx, dir_report);
 	if (err == -EBUSY) {
 		/* The auxiliary PDU is being received */
 		return 0;
@@ -955,7 +977,7 @@ static void isr_rx(const struct bsr_evt *e, void *param)
 
 	rl_idx = lll_scan_rl_idx_get(lll, &match);
 
-	if (has_adva && !lll_scan_isr_rx_check(lll, match.irkmatch_ok, match.devmatch_ok, rl_idx)) {
+	if (has_adva && !lll_scan_isr_rx_filter(lll, &match, rl_idx)) {
 		err = -EINVAL;
 
 		goto isr_rx_do_close;
