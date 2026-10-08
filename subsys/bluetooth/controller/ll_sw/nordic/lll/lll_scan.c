@@ -83,13 +83,6 @@ static inline bool isr_scan_init_check(const struct lll_scan *lll,
 				       uint8_t rl_idx);
 #endif /* CONFIG_BT_CENTRAL */
 
-static bool isr_scan_tgta_check(const struct lll_scan *lll, bool init,
-				uint8_t addr_type, const uint8_t *addr,
-				uint8_t rl_idx, bool *const dir_report);
-static inline bool isr_scan_tgta_rpa_check(const struct lll_scan *lll,
-					   uint8_t addr_type,
-					   const uint8_t *addr,
-					   bool *const dir_report);
 static inline bool isr_scan_rsp_adva_matches(struct pdu_adv *srsp);
 static int isr_rx_scan_report(struct lll_scan *lll, uint8_t devmatch_ok,
 			      uint8_t irkmatch_ok, uint8_t rl_idx,
@@ -141,191 +134,6 @@ void lll_scan_isr_resume(void *param)
 	p.param = param;
 	resume_prepare_cb(&p);
 }
-
-bool lll_scan_isr_rx_check(const struct lll_scan *lll, uint8_t irkmatch_ok,
-			   uint8_t devmatch_ok, uint8_t rl_idx)
-{
-#if defined(CONFIG_BT_CTLR_PRIVACY)
-	return (((lll->filter_policy & SCAN_FP_FILTER) == 0U) &&
-		(!devmatch_ok || ull_filter_lll_rl_idx_allowed(irkmatch_ok,
-							       rl_idx))) ||
-	       (((lll->filter_policy & SCAN_FP_FILTER) != 0U) &&
-		(devmatch_ok || ull_filter_lll_irk_in_fal(rl_idx)));
-#else
-	return ((lll->filter_policy & SCAN_FP_FILTER) == 0U) ||
-		devmatch_ok;
-#endif /* CONFIG_BT_CTLR_PRIVACY */
-}
-
-#if defined(CONFIG_BT_CENTRAL) || defined(CONFIG_BT_CTLR_ADV_EXT)
-bool lll_scan_adva_check(const struct lll_scan *lll, uint8_t addr_type,
-			 const uint8_t *addr, uint8_t rl_idx)
-{
-#if defined(CONFIG_BT_CTLR_PRIVACY)
-	/* Only applies to initiator with no filter accept list */
-	if (rl_idx != FILTER_IDX_NONE) {
-		return (rl_idx == lll->rl_idx);
-	} else if (!ull_filter_lll_rl_addr_allowed(addr_type, addr, &rl_idx)) {
-		return false;
-	}
-#endif /* CONFIG_BT_CTLR_PRIVACY */
-
-	/* NOTE: This function to be used only to check AdvA when initiating,
-	 *       hence, otherwise we should not use the return value.
-	 *       This function is referenced in lll_scan_ext_tgta_check, but
-	 *       is not used when not being an initiator, hence return false
-	 *       is never reached.
-	 */
-#if defined(CONFIG_BT_CENTRAL)
-	return ((lll->adv_addr_type == addr_type) &&
-		!memcmp(lll->adv_addr, addr, BDADDR_SIZE));
-#else /* CONFIG_BT_CENTRAL */
-	return false;
-#endif /* CONFIG_BT_CENTRAL */
-}
-#endif /* CONFIG_BT_CENTRAL || CONFIG_BT_CTLR_ADV_EXT */
-
-#if defined(CONFIG_BT_CTLR_ADV_EXT)
-bool lll_scan_ext_tgta_check(const struct lll_scan *lll, bool pri, bool is_init,
-			     const struct pdu_adv *pdu, uint8_t rl_idx,
-			     bool *const dir_report)
-{
-	const struct pdu_adv_com_ext_adv *com_hdr = &pdu->adv_ext_ind;
-	const struct pdu_adv_ext_hdr *hdr = &com_hdr->ext_hdr;
-	bool is_fal = ((lll->filter_policy & SCAN_FP_FILTER) != 0U);
-	uint8_t adva_size = 0U;
-	bool is_directed = false;
-	bool has_aux = false;
-
-	if (pdu->len < (PDU_AC_EXT_HEADER_SIZE_MIN + com_hdr->ext_hdr_len)) {
-		return false;
-	}
-
-	/* Without an extended header, there are no flags either */
-	if (com_hdr->ext_hdr_len != 0U) {
-		adva_size = (hdr->adv_addr != 0U) ? ADVA_SIZE : 0U;
-		is_directed = (hdr->tgt_addr != 0U);
-		has_aux = (hdr->aux_ptr != 0U);
-
-		if (com_hdr->ext_hdr_len < (sizeof(*hdr) + adva_size +
-					    (is_directed ? TARGETA_SIZE : 0U))) {
-			return false;
-		}
-	}
-
-	if (adva_size == 0U) {
-		/* Other than anonymous advertising has its AdvA in the
-		 * AUX_ADV_IND that the AuxPtr of its ADV_EXT_IND points to
-		 */
-		if (pri && has_aux) {
-			return true;
-		}
-
-		/* Connectable advertising has its AdvA in the AUX_ADV_IND */
-		if (is_init) {
-			return false;
-		}
-	} else if (is_init && !is_fal &&
-		   !lll_scan_adva_check(lll, pdu->tx_addr,
-					&hdr->data[ADVA_OFFSET], rl_idx)) {
-		return false;
-	}
-
-	/* TargetA follows the AdvA, if any */
-	return !is_directed ||
-	       isr_scan_tgta_check(lll, is_init, pdu->rx_addr,
-				   &hdr->data[adva_size], rl_idx, dir_report);
-}
-#endif /* CONFIG_BT_CTLR_ADV_EXT */
-
-#if defined(CONFIG_BT_CENTRAL)
-void lll_scan_prepare_connect_req(struct lll_scan *lll, struct pdu_adv *pdu_tx,
-				  uint8_t phy, uint8_t phy_flags_rx,
-				  uint8_t adv_tx_addr, uint8_t *adv_addr,
-				  uint8_t init_tx_addr, uint8_t *init_addr,
-				  uint32_t *conn_space_us)
-{
-	struct lll_conn *lll_conn;
-	uint32_t conn_interval_us;
-	uint32_t conn_offset_us;
-
-	lll_conn = lll->conn;
-
-	/* Note: this code is also valid for AUX_CONNECT_REQ */
-	pdu_tx->type = PDU_ADV_TYPE_CONNECT_IND;
-
-	/* ChSel is RFU in AUX_CONNECT_REQ, as Channel Selection Algorithm #2
-	 * is used anyway.
-	 */
-	if ((phy == PHY_LEGACY) && IS_ENABLED(CONFIG_BT_CTLR_CHAN_SEL_2)) {
-		pdu_tx->chan_sel = 1;
-	} else {
-		pdu_tx->chan_sel = 0;
-	}
-
-	pdu_tx->tx_addr = init_tx_addr;
-	pdu_tx->rx_addr = adv_tx_addr;
-	pdu_tx->len = sizeof(struct pdu_adv_connect_ind);
-	memcpy(&pdu_tx->connect_ind.init_addr[0], init_addr, BDADDR_SIZE);
-	memcpy(&pdu_tx->connect_ind.adv_addr[0], adv_addr, BDADDR_SIZE);
-	memcpy(&pdu_tx->connect_ind.access_addr[0],
-	       &lll_conn->access_addr[0], 4);
-	memcpy(&pdu_tx->connect_ind.crc_init[0], &lll_conn->crc_init[0], 3);
-	pdu_tx->connect_ind.win_size = 1;
-
-	conn_interval_us = (uint32_t)lll_conn->interval * CONN_INT_UNIT_US;
-	conn_offset_us = radio_tmr_end_get() + EVENT_IFS_US +
-			 PDU_AC_MAX_US(sizeof(struct pdu_adv_connect_ind),
-				       (phy == PHY_LEGACY) ? PHY_1M : phy) -
-			 radio_rx_chain_delay_get(phy, phy_flags_rx);
-
-	/* Add transmitWindowDelay to default calculated connection offset:
-	 * 1.25ms for a legacy PDU, 2.5ms for an LE Uncoded PHY and 3.75ms for
-	 * an LE Coded PHY.
-	 */
-	if (0) {
-#if defined(CONFIG_BT_CTLR_ADV_EXT)
-	} else if (phy) {
-		if (phy & PHY_CODED) {
-			conn_offset_us += WIN_DELAY_CODED;
-		} else {
-			conn_offset_us += WIN_DELAY_UNCODED;
-		}
-#endif
-	} else {
-		conn_offset_us += WIN_DELAY_LEGACY;
-	}
-
-	if (!IS_ENABLED(CONFIG_BT_CTLR_SCHED_ADVANCED) ||
-	    lll->conn_win_offset_us == 0U) {
-		*conn_space_us = conn_offset_us;
-		pdu_tx->connect_ind.win_offset = sys_cpu_to_le16(0);
-	} else {
-		uint32_t win_offset_us = radio_tmr_start_latency_get() +
-			lll->conn_win_offset_us +
-			radio_rx_ready_delay_get(phy, PHY_FLAGS_S8);
-
-		while ((win_offset_us & ((uint32_t)1 << 31)) ||
-		       (win_offset_us < conn_offset_us)) {
-			win_offset_us += conn_interval_us;
-		}
-
-		*conn_space_us = win_offset_us;
-		pdu_tx->connect_ind.win_offset =
-			sys_cpu_to_le16((win_offset_us - conn_offset_us) /
-					CONN_INT_UNIT_US);
-		pdu_tx->connect_ind.win_size++;
-	}
-
-	pdu_tx->connect_ind.interval = sys_cpu_to_le16(lll_conn->interval);
-	pdu_tx->connect_ind.latency = sys_cpu_to_le16(lll_conn->latency);
-	pdu_tx->connect_ind.timeout = sys_cpu_to_le16(lll->conn_timeout);
-	memcpy(&pdu_tx->connect_ind.chan_map[0], &lll_conn->data_chan_map[0],
-	       sizeof(pdu_tx->connect_ind.chan_map));
-	pdu_tx->connect_ind.hop = lll_conn->data_chan_hop;
-	pdu_tx->connect_ind.sca = lll_clock_sca_local_get();
-}
-#endif /* CONFIG_BT_CENTRAL */
 
 static int init_reset(void)
 {
@@ -1239,10 +1047,12 @@ static inline int isr_rx_pdu(struct lll_scan *lll, struct pdu_adv *pdu_adv_rx,
 		pdu_tx = (void *)radio_pkt_scratch_get();
 
 		lll_scan_prepare_connect_req(lll, pdu_tx, PHY_LEGACY,
-					     PHY_FLAGS_S8, pdu_adv_rx->tx_addr,
-					     pdu_adv_rx->adv_ind.addr,
-					     init_tx_addr, init_addr,
-					     &conn_space_us);
+			radio_tmr_end_get() -
+			radio_rx_chain_delay_get(PHY_LEGACY, PHY_FLAGS_S8),
+			radio_tmr_start_latency_get() + lll->conn_win_offset_us +
+			radio_rx_ready_delay_get(PHY_LEGACY, PHY_FLAGS_S8),
+			pdu_adv_rx->tx_addr, pdu_adv_rx->adv_ind.addr,
+			init_tx_addr, init_addr, &conn_space_us);
 
 		radio_pkt_tx_set(pdu_tx);
 
@@ -1445,7 +1255,7 @@ static inline int isr_rx_pdu(struct lll_scan *lll, struct pdu_adv *pdu_adv_rx,
 		  ((pdu_adv_rx->type == PDU_ADV_TYPE_DIRECT_IND) &&
 		   (pdu_adv_rx->len == sizeof(struct pdu_adv_direct_ind)) &&
 		   (/* allow directed adv packets addressed to this device */
-		    isr_scan_tgta_check(lll, false, pdu_adv_rx->rx_addr,
+		    lll_scan_tgta_check(lll, false, pdu_adv_rx->rx_addr,
 					pdu_adv_rx->direct_ind.tgt_addr,
 					rl_idx, &dir_report))) ||
 #if defined(CONFIG_BT_CTLR_ADV_EXT)
@@ -1508,52 +1318,11 @@ static inline bool isr_scan_init_check(const struct lll_scan *lll,
 		 ((pdu->type == PDU_ADV_TYPE_DIRECT_IND) &&
 		  (pdu->len == sizeof(struct pdu_adv_direct_ind)) &&
 		  (/* allow directed adv packets addressed to this device */
-			  isr_scan_tgta_check(lll, true, pdu->rx_addr,
+			  lll_scan_tgta_check(lll, true, pdu->rx_addr,
 					      pdu->direct_ind.tgt_addr, rl_idx,
 					      NULL)))));
 }
 #endif /* CONFIG_BT_CENTRAL */
-
-static bool isr_scan_tgta_check(const struct lll_scan *lll, bool init,
-				uint8_t addr_type, const uint8_t *addr,
-				uint8_t rl_idx, bool *dir_report)
-{
-#if defined(CONFIG_BT_CTLR_PRIVACY)
-	if (ull_filter_lll_rl_addr_resolve(addr_type, addr, rl_idx)) {
-		return true;
-	} else if (init && lll->rpa_gen && ull_filter_lll_lrpa_get(rl_idx)) {
-		/* Initiator generating RPAs, and could not resolve TargetA:
-		 * discard
-		 */
-		return false;
-	}
-#endif /* CONFIG_BT_CTLR_PRIVACY */
-
-	return (((lll->init_addr_type == addr_type) &&
-		 !memcmp(lll->init_addr, addr, BDADDR_SIZE))) ||
-	       /* allow directed adv packets where TargetA address
-		* is resolvable private address (scanner only)
-		*/
-	       isr_scan_tgta_rpa_check(lll, addr_type, addr, dir_report);
-}
-
-static inline bool isr_scan_tgta_rpa_check(const struct lll_scan *lll,
-					   uint8_t addr_type,
-					   const uint8_t *addr,
-					   bool *const dir_report)
-{
-	if (((lll->filter_policy & SCAN_FP_EXT) != 0U) && (addr_type != 0U) &&
-	    ((addr[5] & 0xc0) == 0x40)) {
-
-		if (dir_report) {
-			*dir_report = true;
-		}
-
-		return true;
-	}
-
-	return false;
-}
 
 static inline bool isr_scan_rsp_adva_matches(struct pdu_adv *srsp)
 {

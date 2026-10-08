@@ -70,9 +70,6 @@ static void isr_tx_scan_req_lll_schedule(void *param);
 #if defined(CONFIG_BT_CENTRAL)
 static void isr_tx_connect_req(void *param);
 static void isr_rx_connect_rsp(void *param);
-static bool isr_rx_connect_rsp_check(struct lll_scan *lll,
-				     struct pdu_adv *pdu_tx,
-				     struct pdu_adv *pdu_rx, uint8_t rl_idx);
 static void isr_early_abort(void *param);
 #endif /* CONFIG_BT_CENTRAL */
 
@@ -1061,10 +1058,12 @@ static int isr_rx_pdu(struct lll_scan *lll, struct lll_scan_aux *lll_aux,
 		pdu_tx = radio_pkt_scratch_get();
 
 		lll_scan_prepare_connect_req(lll, pdu_tx, phy_aux,
-					     phy_aux_flags_rx, pdu->tx_addr,
-					     pdu->adv_ext_ind.ext_hdr.data,
-					     init_tx_addr, init_addr,
-					     &conn_space_us);
+			radio_tmr_end_get() -
+			radio_rx_chain_delay_get(phy_aux, phy_aux_flags_rx),
+			radio_tmr_start_latency_get() + lll->conn_win_offset_us +
+			radio_rx_ready_delay_get(phy_aux, PHY_FLAGS_S8),
+			pdu->tx_addr, pdu->adv_ext_ind.ext_hdr.data,
+			init_tx_addr, init_addr, &conn_space_us);
 
 		radio_pkt_tx_set(pdu_tx);
 
@@ -1586,8 +1585,8 @@ static void isr_rx_connect_rsp(void *param)
 		LL_ASSERT_DBG(node_rx);
 		pdu_rx = (void *)node_rx->pdu;
 
-		trx_done = isr_rx_connect_rsp_check(lll, pdu_tx, pdu_rx,
-						    rl_idx);
+		trx_done = lll_scan_aux_connect_rsp_check(lll, pdu_tx, pdu_rx,
+							  rl_idx);
 	} else {
 		trx_done = 0U;
 	}
@@ -1677,48 +1676,6 @@ isr_rx_connect_rsp_do_close:
 	}
 
 	radio_disable();
-}
-
-static bool isr_rx_connect_rsp_check(struct lll_scan *lll,
-				     struct pdu_adv *pdu_tx,
-				     struct pdu_adv *pdu_rx, uint8_t rl_idx)
-{
-	const uint8_t *adva;
-	bool is_adva;
-
-	if (unlikely(pdu_rx->type != PDU_ADV_TYPE_AUX_CONNECT_RSP)) {
-		return false;
-	}
-
-	if (unlikely(pdu_rx->len != (offsetof(struct pdu_adv_com_ext_adv, ext_hdr_adv_data) +
-				     offsetof(struct pdu_adv_ext_hdr, data) + ADVA_SIZE +
-				     TARGETA_SIZE))) {
-		return false;
-	}
-
-	if (unlikely(pdu_rx->adv_ext_ind.adv_mode || !pdu_rx->adv_ext_ind.ext_hdr.adv_addr ||
-		     !pdu_rx->adv_ext_ind.ext_hdr.tgt_addr)) {
-		return false;
-	}
-
-	adva = &pdu_rx->adv_ext_ind.ext_hdr.data[ADVA_OFFSET];
-
-	/* With the Filter Accept List, the Host gives no peer address, so the
-	 * advertiser is the one the AUX_CONNECT_REQ was sent to.
-	 */
-	if ((lll->filter_policy & SCAN_FP_FILTER) != 0U) {
-		is_adva = (pdu_rx->tx_addr == pdu_tx->rx_addr) &&
-			  (memcmp(adva, pdu_tx->connect_ind.adv_addr,
-				  BDADDR_SIZE) == 0);
-	} else {
-		is_adva = lll_scan_adva_check(lll, pdu_rx->tx_addr, adva,
-					      rl_idx);
-	}
-
-	return is_adva &&
-	       (pdu_rx->rx_addr == pdu_tx->tx_addr) &&
-	       (memcmp(&pdu_rx->adv_ext_ind.ext_hdr.data[TGTA_OFFSET],
-		       pdu_tx->connect_ind.init_addr, BDADDR_SIZE) == 0);
 }
 
 static void isr_early_abort(void *param)
