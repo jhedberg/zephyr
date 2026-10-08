@@ -87,8 +87,10 @@ bool bsr_cntr_cmp_evt_get_clear(void);
 
 /*
  * Transmit a PDU (2 byte header followed by the payload, without CRC) with
- * its first preamble bit at time 'at'. The PDU is copied, and the model
- * appends the CRC.
+ * its first preamble bit at time 'at'. As a radio reading the packet with
+ * DMA, the model reads the PDU when the transmission starts, hence pdu must
+ * stay valid until then, and changes made to it before then are sent. The
+ * model appends the CRC.
  *
  * Returns an operation id, or 0 if the request could not be accepted (an
  * operation is already pending, or 'at' is not in the future).

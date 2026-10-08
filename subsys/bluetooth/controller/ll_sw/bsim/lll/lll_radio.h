@@ -28,7 +28,9 @@ void lll_radio_init(void);
 void lll_radio_isr(void);
 
 /* Transmit pdu (header and payload, without CRC) with its first bit at time
- * 'at'. The PDU is copied, hence the buffer can be reused right away.
+ * 'at'. The PDU is read when the transmission starts, as by a radio with DMA:
+ * the buffer must be kept until then, and changes to it until then are sent,
+ * e.g. an AuxPtr offset filled in after the Tx has been requested.
  */
 void lll_radio_tx(const struct bsr_pkt_cfg *cfg, uint32_t at, const void *pdu,
 		  lll_radio_cb_t cb, void *param);

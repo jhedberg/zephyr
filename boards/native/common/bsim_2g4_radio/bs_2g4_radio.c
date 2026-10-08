@@ -79,6 +79,7 @@ struct op {
 	bs_time_t start;    /* Device time of the first preamble bit */
 	uint32_t window_us; /* Rx only */
 	uint8_t *rx_buf;    /* Rx only, embedded side buffer */
+	const uint8_t *tx_pdu; /* Tx only, embedded side PDU, read at Tx start */
 	struct bsr_evt evt;
 
 	uint8_t pkt[BSR_PKT_LEN_MAX];
@@ -416,10 +417,14 @@ static void rx_response_handle(struct op *op, int ret)
 static void tx_start(struct op *op)
 {
 	p2G4_txv2_t *req = &op->tx_req;
-	uint8_t len = op->pkt[1];
 	bs_time_t recheck;
 	uint32_t dur;
+	uint8_t len;
 	int ret;
+
+	/* The PDU is read when the transmission starts, as with DMA */
+	len = op->tx_pdu[1];
+	memcpy(op->pkt, op->tx_pdu, BSR_PDU_HEADER_LEN + len);
 
 	op->pkt_len = BSR_PDU_HEADER_LEN + len + BSR_CRC_LEN;
 	uint32_t crc = ble_crc24(op->pkt, BSR_PDU_HEADER_LEN + len, op->cfg.crc_init);
@@ -698,7 +703,7 @@ uint32_t bsr_tx(const struct bsr_pkt_cfg *cfg, uint32_t at, const uint8_t *pdu)
 		return 0U;
 	}
 
-	memcpy(op->pkt, pdu, BSR_PDU_HEADER_LEN + pdu[1]);
+	op->tx_pdu = pdu;
 
 	return op->id;
 }
