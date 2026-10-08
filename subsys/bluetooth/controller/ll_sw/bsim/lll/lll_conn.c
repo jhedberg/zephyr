@@ -84,6 +84,11 @@ static struct {
 	uint8_t trx_busy_iteration;
 #if defined(CONFIG_BT_CTLR_LE_ENC)
 	uint8_t mic_state;
+
+	/* The Rx in progress receives an encrypted PDU into pdu_enc_rx. Kept
+	 * from the start of the Rx, as the ULL may change enc_rx before it ends.
+	 */
+	uint8_t rx_enc;
 #endif /* CONFIG_BT_CTLR_LE_ENC */
 } evt;
 
@@ -489,7 +494,7 @@ static void isr_rx(const struct bsr_evt *e, void *param)
 	LL_ASSERT_DBG(node_rx);
 
 #if defined(CONFIG_BT_CTLR_LE_ENC)
-	pdu_rx = lll->enc_rx ? (void *)pdu_enc_rx : (void *)node_rx->pdu;
+	pdu_rx = evt.rx_enc ? (void *)pdu_enc_rx : (void *)node_rx->pdu;
 #else /* !CONFIG_BT_CTLR_LE_ENC */
 	pdu_rx = (void *)node_rx->pdu;
 #endif /* !CONFIG_BT_CTLR_LE_ENC */
@@ -732,7 +737,7 @@ static int isr_rx_pdu(struct lll_conn *lll, struct pdu_data *pdu_rx, struct pdu_
 
 		if (pdu_rx->len != 0U) {
 #if defined(CONFIG_BT_CTLR_LE_ENC)
-			if (lll->enc_rx) {
+			if (evt.rx_enc) {
 				bool mic_ok;
 
 				mic_ok = lll_ccm_decrypt(&lll->ccm_rx, pdu_rx, pdu_node);
@@ -868,7 +873,8 @@ static void rx(struct lll_conn *lll, uint32_t start, uint32_t window_us)
 	buf = node_rx->pdu;
 
 #if defined(CONFIG_BT_CTLR_LE_ENC)
-	if (lll->enc_rx) {
+	evt.rx_enc = lll->enc_rx;
+	if (evt.rx_enc) {
 		/* Received into its own buffer, and decrypted into the node rx
 		 * if it is new data.
 		 */
