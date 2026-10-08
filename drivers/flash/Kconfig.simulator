@@ -102,6 +102,14 @@ config FLASH_SIMULATOR_STAT_PAGE_COUNT
 	  This is why it's not possible to calculate the number of pages with
 	  preprocessor using DT properties.
 
+config FLASH_SIMULATOR_IN_RAM_BY_DEFAULT
+	bool "Keep the flash in RAM unless a file is given"
+	depends on ARCH_POSIX
+	help
+	  Several instances of a program that run in the same folder, like the
+	  devices of a BabbleSim simulation, would otherwise all use the same
+	  default flash file.
+
 config FLASH_SIMULATOR_EX_OP
 	bool "Extended operations API"
 	select FLASH_HAS_EX_OP
