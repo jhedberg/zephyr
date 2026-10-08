@@ -170,7 +170,8 @@ static int prepare_cb(struct lll_prepare_param *p)
 #endif /* CONFIG_BT_CTLR_ADV_ISO && CONFIG_BT_TICKER_EXT_EXPIRE_INFO */
 
 	if (lll_preempt_calc(p)) {
-		lll_radio_stop(isr_done, lll);
+		/* Not sent, the event is done */
+		lll_event_abort(lll);
 
 		return -ECANCELED;
 	}

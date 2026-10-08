@@ -26,7 +26,6 @@
 #include <zephyr/toolchain.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/util.h>
-#include <zephyr/bluetooth/hci_types.h>
 
 #include "hal/ccm.h"
 #include "hal/radio.h"
@@ -189,51 +188,6 @@ void lll_sync_isr_aux_release(struct lll_sync *lll, struct lll_scan_aux *lll_aux
 
 	ull_rx_put_sched(node_rx->hdr.link, node_rx);
 }
-
-#if defined(CONFIG_BT_CTLR_SYNC_PERIODIC_CTE_TYPE_FILTERING)
-enum sync_status lll_sync_cte_is_allowed(uint8_t cte_type_mask, uint8_t filter_policy,
-					 uint8_t rx_cte_time, uint8_t rx_cte_type)
-{
-	bool cte_ok;
-
-	if (cte_type_mask == BT_HCI_LE_PER_ADV_CREATE_SYNC_CTE_TYPE_NO_FILTERING) {
-		return SYNC_STAT_ALLOWED;
-	}
-
-	if (rx_cte_time > 0) {
-		if ((cte_type_mask & BT_HCI_LE_PER_ADV_CREATE_SYNC_CTE_TYPE_NO_CTE) != 0) {
-			cte_ok = false;
-		} else {
-			switch (rx_cte_type) {
-			case BT_HCI_LE_AOA_CTE:
-				cte_ok = !(cte_type_mask &
-					   BT_HCI_LE_PER_ADV_CREATE_SYNC_CTE_TYPE_NO_AOA);
-				break;
-			case BT_HCI_LE_AOD_CTE_1US:
-				cte_ok = !(cte_type_mask &
-					   BT_HCI_LE_PER_ADV_CREATE_SYNC_CTE_TYPE_NO_AOD_1US);
-				break;
-			case BT_HCI_LE_AOD_CTE_2US:
-				cte_ok = !(cte_type_mask &
-					   BT_HCI_LE_PER_ADV_CREATE_SYNC_CTE_TYPE_NO_AOD_2US);
-				break;
-			default:
-				/* Unknown or forbidden CTE type */
-				cte_ok = false;
-			}
-		}
-	} else {
-		/* No CTEInfo in the PDU */
-		cte_ok = !(cte_type_mask & BT_HCI_LE_PER_ADV_CREATE_SYNC_CTE_TYPE_ONLY_CTE);
-	}
-
-	if (!cte_ok) {
-		return filter_policy ? SYNC_STAT_CONT_SCAN : SYNC_STAT_TERM;
-	}
-
-	return SYNC_STAT_ALLOWED;
-}
-#endif /* CONFIG_BT_CTLR_SYNC_PERIODIC_CTE_TYPE_FILTERING */
 
 /* Channel of the current event */
 static uint8_t data_channel_calc(struct lll_sync *lll)
