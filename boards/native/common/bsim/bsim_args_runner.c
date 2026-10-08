@@ -44,6 +44,10 @@ static bool nosim;
 static int extra_argc;
 static char **extra_argv;
 
+/* The command line, for the native simulator code that asks for it */
+static int cmd_argc;
+static char **cmd_argv;
+
 static void cmd_trace_lvl_found(char *argv, int offset)
 {
 	bs_trace_set_level(global_args.verb);
@@ -199,6 +203,9 @@ static void nsi_handle_one_cmdline_argument(char *argv)
  */
 void nsi_handle_cmd_line(int argc, char *argv[])
 {
+	cmd_argc = argc;
+	cmd_argv = argv;
+
 	bs_args_set_defaults(args_struct);
 	global_args.verb = 2;
 	bs_trace_set_level(global_args.verb);
@@ -209,6 +216,19 @@ void nsi_handle_cmd_line(int argc, char *argv[])
 	for (int i = 1; i < argc; i++) {
 		nsi_handle_one_cmdline_argument(argv[i]);
 	}
+}
+
+void nsi_get_cmd_line_args(int *argc, char ***argv)
+{
+	*argc = cmd_argc;
+	*argv = cmd_argv;
+}
+
+/* The test of each CPU gets its arguments with -argstest instead */
+void nsi_get_test_cmd_line_args(int *argc, char ***argv)
+{
+	*argc = 0;
+	*argv = NULL;
 }
 
 void nsi_register_extra_args(int argc, char *argv[])

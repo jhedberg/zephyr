@@ -90,3 +90,8 @@ void nsi_vprint_trace(const char *format, va_list vargs)
 	bs_trace_vprint(BS_TRACE_RAW, cpu_prefix, cpu_number, 2, BS_TRACE_AUTOTIME, 0,
 				format, vargs);
 }
+
+int nsi_trace_over_tty(int file_number)
+{
+	return bs_trace_is_tty(file_number);
+}

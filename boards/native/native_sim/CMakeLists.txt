@@ -5,10 +5,14 @@ zephyr_library()
 zephyr_library_sources(
   cmdline.c
   cpu_wait.c
-  nsi_if.c
   irq_handler.c
   misc.c
   posix_arch_if.c
+)
+
+# The BabbleSim variant has the native simulator hooks of the BabbleSim boards
+zephyr_library_sources_ifndef(CONFIG_BOARD_NATIVE_SIM_NATIVE_BSIM
+  "nsi_if.c"
 )
 
 if(CONFIG_NATIVE_SIM_REBOOT)
@@ -34,9 +38,13 @@ add_subdirectory(${ZEPHYR_BASE}/boards/native/common/extra_args/
   ${CMAKE_CURRENT_BINARY_DIR}/extra_args
 )
 
-set(nsi_config_content
-  ${nsi_config_content}
-  "NSI_NATIVE=1"
-)
+if(CONFIG_BOARD_NATIVE_SIM_NATIVE_BSIM)
+  add_subdirectory("bsim")
+else()
+  set(nsi_config_content
+    ${nsi_config_content}
+    "NSI_NATIVE=1"
+  )
+endif()
 
 include(../common/natsim_config.cmake)

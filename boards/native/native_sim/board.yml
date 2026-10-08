@@ -6,3 +6,4 @@ boards:
   - name: native
     variants:
     - name: "64"
+    - name: bsim

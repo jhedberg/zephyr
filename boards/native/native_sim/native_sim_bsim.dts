@@ -1,0 +1,51 @@
+/*
+ * Copyright The Zephyr Project Contributors
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include "native_sim.dts"
+
+/ {
+	chosen {
+		zephyr,bt-hci = &bt_hci_controller;
+		zephyr,bt-c2h-uart = &uart1;
+	};
+
+	/* The native_sim drivers use fixed interrupt lines, but the radio
+	 * model takes its lines from the devicetree.
+	 */
+	intc: interrupt-controller {
+		compatible = "zephyr,native-sim-intc";
+		interrupt-controller;
+		#interrupt-cells = <2>;
+	};
+
+	/* Lines 0 to 2 are the ones of the native_sim timer, the software
+	 * interrupt offload and the counter.
+	 */
+	bsim_2g4_radio: bsim-2g4-radio {
+		compatible = "zephyr,bsim-2g4-radio";
+		interrupt-parent = <&intc>;
+		interrupts = <3 0>, <4 0>, <5 0>, <6 0>;
+		interrupt-names = "radio", "cntr", "swi-lll", "swi-ull-low";
+
+		bt_hci_controller: bt_hci_controller {
+			compatible = "zephyr,bt-hci-ll-sw-split";
+			status = "okay";
+		};
+	};
+};
+
+&bt_hci_userchan {
+	status = "disabled";
+};
+
+&uart1 {
+	status = "okay";
+
+	bt_hci_uart: bt_hci_uart {
+		compatible = "zephyr,bt-hci-uart";
+		status = "okay";
+	};
+};
