@@ -63,6 +63,10 @@ if(CONFIG_BT_CTLR_LE_ENC OR CONFIG_BT_CTLR_BROADCAST_ISO_ENC)
   )
 endif()
 
+zephyr_library_sources_ifdef(CONFIG_BT_CTLR_ISO_VENDOR_DATA_PATH
+  "ull/ull_iso_vendor.c"
+)
+
 # The LLL uses the software AES of ecb.c for CCM and address resolution too
 zephyr_library_sources(
   "hal/bsim/cntr.c"
