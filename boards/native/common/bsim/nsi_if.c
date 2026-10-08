@@ -33,8 +33,6 @@
 					     _irq_raised)
 #define nsif_cpun_test_hook          _CONCAT(_CONCAT(nsif_cpu, CONFIG_NATIVE_SIMULATOR_MCU_N),\
 					     _test_hook)
-#define nsif_cpun_irq_raised_from_sw _CONCAT(_CONCAT(nsif_cpu, CONFIG_NATIVE_SIMULATOR_MCU_N),\
-					     _irq_raised_from_sw)
 
 NATIVE_SIMULATOR_IF void nsif_cpun_pre_cmdline_hooks(void)
 {
@@ -120,10 +118,4 @@ NATIVE_SIMULATOR_IF int nsif_cpun_test_hook(void *p)
 	(void) p;
 	bst_tick(nsi_hws_get_time());
 	return 0;
-}
-
-NATIVE_SIMULATOR_IF void nsif_cpun_irq_raised_from_sw(void)
-{
-	void posix_irq_handler_im_from_sw(void);
-	posix_irq_handler_im_from_sw();
 }

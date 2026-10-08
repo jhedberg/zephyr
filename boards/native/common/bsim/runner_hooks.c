@@ -13,7 +13,7 @@
 #include "nsi_tasks.h"
 #include "nsi_main.h"
 #include "nsi_hw_scheduler.h"
-#include "NRF_HWLowL.h"
+#include "bsim_board_if.h"
 #include "bsim_args_runner.h"
 
 static bool bsim_disconnect_on_exit;
