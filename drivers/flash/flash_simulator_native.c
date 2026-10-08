@@ -28,6 +28,28 @@
 #include <string.h>
 #include <nsi_tracing.h>
 
+/* Create the folders of a file path which do not exist yet. Errors are left
+ * for opening the file to report.
+ */
+static void create_folders(const char *path)
+{
+	char *folder;
+	char *sep;
+
+	folder = strdup(path);
+	if (folder == NULL) {
+		return;
+	}
+
+	for (sep = strchr(folder + 1, '/'); sep != NULL; sep = strchr(sep + 1, '/')) {
+		*sep = '\0';
+		(void)mkdir(folder, 0777);
+		*sep = '/';
+	}
+
+	free(folder);
+}
+
 /*
  * Initialize the flash buffer.
  * And, if the content is to be kept on disk map it to the buffer to the file.
@@ -50,6 +72,11 @@ int flash_mock_init_native(bool flash_in_ram, uint8_t **mock_flash, unsigned int
 			return -1;
 		}
 	} else {
+		/* As with the flash models of the nrf_bsim boards, the file can be in a
+		 * folder of the simulation which is not there yet.
+		 */
+		create_folders(flash_file_path);
+
 		*flash_fd = open(flash_file_path, O_RDWR | O_CREAT | O_CLOEXEC, (mode_t)0600);
 		if (*flash_fd == -1) {
 			nsi_print_warning("Failed to open flash device file "
