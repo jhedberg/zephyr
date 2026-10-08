@@ -18,6 +18,36 @@ configdefault NET_L2_ETHERNET
 configdefault ETH_NATIVE_TAP
 	default y if NET_L2_ETHERNET && ETH_DRIVER
 
+if BOARD_NATIVE_SIM_NATIVE_BSIM
+
+# BabbleSim seeds the random generator of each device of a simulation
+# differently, so that they do not all draw the same numbers.
+configdefault FAKE_ENTROPY_NATIVE_SIM_SEED_BY_DEFAULT
+	default n
+
+# The Phy decides when the simulated time of the devices advances.
+configdefault NATIVE_SIM_SLOWDOWN_TO_REAL_TIME
+	default n
+
+# Print in the trace of the device, as the other BabbleSim boards do.
+configdefault POSIX_ARCH_CONSOLE
+	default y if CONSOLE
+
+configdefault UART_CONSOLE
+	default n
+
+# The devices of a simulation run in the same folder, and the bsim tests
+# expect each device to have a flash of its own unless they give a file.
+configdefault FLASH_SIMULATOR_IN_RAM_BY_DEFAULT
+	default y
+
+# The bsim tests are timed for the finer ticks of the other BabbleSim
+# boards, which the 10 ms ticks of native_sim would delay.
+configdefault SYS_CLOCK_TICKS_PER_SEC
+	default 10000 if TICKLESS_KERNEL
+
+endif # BOARD_NATIVE_SIM_NATIVE_BSIM
+
 if CONSOLE
 
 config POSIX_ARCH_CONSOLE

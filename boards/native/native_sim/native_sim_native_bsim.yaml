@@ -1,0 +1,22 @@
+identifier: native_sim/native/bsim
+name: Native Simulation port - BabbleSim variant
+type: native
+simulation:
+  - name: native
+arch: posix
+ram: 65536
+flash: 65536
+env:
+  - BSIM_OUT_PATH
+toolchain:
+  - host
+  - llvm
+supported:
+  - bsim
+  - counter
+  - gpio
+testing:
+  ignore_tags:
+    - modem
+    - bsim_skip_CI
+vendor: zephyr
