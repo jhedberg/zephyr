@@ -388,6 +388,20 @@ static void se_rx(struct lll_conn_iso_group *cig, const struct lll_conn_iso_stre
 	lll_radio_rx(&evt.cfg, start_us, window_us, evt.pdu_rx, cb, cig);
 }
 
+#if defined(CONFIG_TEST_FT_SKIP_SUBEVENTS)
+/* Test hook of the flush timeout tests, as in the Nordic LLL: what is received
+ * in the first 2 subevents of skip_count events in every 3, and in the first
+ * subevent of the event after them, is ignored.
+ */
+static bool test_ft_skip(const struct cis_evt *c, uint8_t skip_count)
+{
+	uint8_t n = c->lll->event_count % 3U;
+
+	return ((n < skip_count) && (c->se <= 2U)) ||
+	       ((n < (skip_count + 1U)) && (c->se <= 1U));
+}
+#endif /* CONFIG_TEST_FT_SKIP_SUBEVENTS */
+
 /* Anchor point of a CIS in the event of the burst of its current Rx payload,
  * the timestamp of the payload.
  */
@@ -558,6 +572,9 @@ static void isr_rx_central(const struct bsr_evt *e, void *param)
 	}
 
 	is_aa = (e->status == BSR_STATUS_OK) || (e->status == BSR_STATUS_CRC_ERR);
+#if defined(CONFIG_TEST_FT_CEN_SKIP_SUBEVENTS)
+	is_aa = is_aa && !test_ft_skip(c, CONFIG_TEST_FT_CEN_SKIP_EVENTS_COUNT);
+#endif /* CONFIG_TEST_FT_CEN_SKIP_SUBEVENTS */
 	if (is_aa && (e->status == BSR_STATUS_OK)) {
 		trx_performed();
 
@@ -647,6 +664,7 @@ static void isr_rx_peripheral(const struct bsr_evt *e, void *param)
 	struct cis_evt *c = evt.curr;
 	struct lll_conn_iso_stream *cis = c->lll;
 	bool is_new;
+	bool is_aa;
 	bool cie;
 
 	if (is_gone(c)) {
@@ -656,7 +674,11 @@ static void isr_rx_peripheral(const struct bsr_evt *e, void *param)
 		return;
 	}
 
-	if ((e->status != BSR_STATUS_OK) && (e->status != BSR_STATUS_CRC_ERR)) {
+	is_aa = (e->status == BSR_STATUS_OK) || (e->status == BSR_STATUS_CRC_ERR);
+#if defined(CONFIG_TEST_FT_PER_SKIP_SUBEVENTS)
+	is_aa = is_aa && !test_ft_skip(c, CONFIG_TEST_FT_PER_SKIP_EVENTS_COUNT);
+#endif /* CONFIG_TEST_FT_PER_SKIP_SUBEVENTS */
+	if (!is_aa) {
 		/* No response without the PDU of the central: its payloads
 		 * at their flush point at the end of the subevent, and the Tx
 		 * payloads at theirs at the end of an earlier one, are done.
