@@ -5,5 +5,7 @@
  */
 
 /* There is no Direction Finding support, the ULL only needs these declared */
+#define BT_CTLR_DF_PER_ADV_CTE_NUM_MAX 0
+
 struct lll_df_sync;
 struct lll_df_conn_rx_cfg;

@@ -16,6 +16,9 @@ if(CONFIG_BT_BROADCASTER)
     "lll/lll_adv.c"
     "../lll_adv_pdu.c"
   )
+  zephyr_library_sources_ifdef(CONFIG_BT_CTLR_ADV_EXT
+    "lll/lll_adv_aux.c"
+  )
 endif()
 
 if(CONFIG_BT_OBSERVER)
