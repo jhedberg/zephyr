@@ -38,6 +38,7 @@
 #include "lll_adv.h"
 #include "lll_adv_pdu.h"
 #include "lll_adv_aux.h"
+#include "lll_adv_sync.h"
 #include "lll_filter.h"
 
 #include "lll_internal.h"
@@ -439,6 +440,15 @@ static int prepare_cb(struct lll_prepare_param *p)
 	}
 
 	lll_aux->data_chan_counter++;
+
+	/* With the expiry information of the periodic advertising ticker, the
+	 * LLL fills in the SyncInfo rather than the ULL.
+	 */
+	if (IS_ENABLED(CONFIG_BT_CTLR_ADV_PERIODIC) &&
+	    IS_ENABLED(CONFIG_BT_TICKER_EXT_EXPIRE_INFO) &&
+	    (pdu->adv_ext_ind.ext_hdr_len != 0U) && (pdu->adv_ext_ind.ext_hdr.sync_info != 0U)) {
+		ull_adv_sync_lll_syncinfo_fill(pdu, lll_aux);
+	}
 
 	if (lll_preempt_calc(p) != 0U) {
 		lll_radio_stop(isr_done, lll_aux);

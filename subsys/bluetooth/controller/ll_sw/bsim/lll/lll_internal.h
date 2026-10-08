@@ -31,9 +31,10 @@ void lll_resume_param_set(struct lll_prepare_param *p);
  */
 void lll_event_abort(void *param);
 
-/* The abort callback of the radio events that need no clean up of their own
- * when aborted.
+/* The callbacks of the radio events that are never resumed, and that need no
+ * clean up of their own when aborted.
  */
+int lll_is_abort_cb(void *next, void *curr, lll_prepare_cb_t *resume_cb);
 void lll_abort_cb(struct lll_prepare_param *prepare_param, void *param);
 
 /* End the current radio event now, from a radio ISR callback */
