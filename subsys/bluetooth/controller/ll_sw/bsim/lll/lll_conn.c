@@ -8,6 +8,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <string.h>
 
 #include <zephyr/toolchain.h>
 #include <zephyr/sys/byteorder.h>
@@ -34,9 +35,13 @@
 #include "lll_internal.h"
 #include "lll_tim_internal.h"
 #include "lll_radio.h"
+#include "lll_ccm.h"
 #include "lll_conn_internal.h"
 
 #include "hal/debug.h"
+
+#define PDU_DC_BUF_SIZE (offsetof(struct pdu_data, lldata) + PDU_DC_PAYLOAD_SIZE_MAX + \
+			 PDU_MIC_SIZE)
 
 static void rx(struct lll_conn *lll, uint32_t start, uint32_t window_us);
 
@@ -53,9 +58,22 @@ static struct {
 	uint8_t crc_expire;
 	uint8_t is_aborted;
 	uint8_t trx_busy_iteration;
+#if defined(CONFIG_BT_CTLR_LE_ENC)
+	uint8_t mic_state;
+
+	/* The Rx in progress receives an encrypted PDU into pdu_enc_rx. Kept
+	 * from the start of the Rx, as the ULL may change enc_rx before it ends.
+	 */
+	uint8_t rx_enc;
+#endif /* CONFIG_BT_CTLR_LE_ENC */
 } evt;
 
 static struct pdu_data pdu_empty;
+
+#if defined(CONFIG_BT_CTLR_LE_ENC)
+static uint8_t pdu_enc_tx[PDU_DC_BUF_SIZE] __aligned(4);
+static uint8_t pdu_enc_rx[PDU_DC_BUF_SIZE] __aligned(4);
+#endif /* CONFIG_BT_CTLR_LE_ENC */
 
 #if defined(CONFIG_BT_CTLR_FORCE_MD_COUNT) && \
 	(CONFIG_BT_CTLR_FORCE_MD_COUNT > 0)
@@ -153,6 +171,10 @@ void lll_conn_prepare_reset(void)
 	evt.is_aborted = 0U;
 	evt.trx_busy_iteration = 0U;
 	evt.aa_end = 0U;
+
+#if defined(CONFIG_BT_CTLR_LE_ENC)
+	evt.mic_state = LLL_CONN_MIC_NONE;
+#endif /* CONFIG_BT_CTLR_LE_ENC */
 }
 
 uint8_t lll_conn_event_setup(struct lll_conn *lll, const struct lll_prepare_param *p)
@@ -202,6 +224,10 @@ static void event_done(struct lll_conn *lll)
 	e->crc_valid = evt.crc_valid;
 	e->is_aborted = evt.is_aborted;
 
+#if defined(CONFIG_BT_CTLR_LE_ENC)
+	e->mic_state = evt.mic_state;
+#endif /* CONFIG_BT_CTLR_LE_ENC */
+
 #if defined(CONFIG_BT_PERIPHERAL)
 	if ((evt.trx_cnt != 0U) && (lll->role == BT_HCI_ROLE_PERIPHERAL)) {
 		uint8_t phy_rx;
@@ -232,15 +258,30 @@ static void isr_tx_last(const struct bsr_evt *e, void *param)
 	event_done(param);
 }
 
+static inline bool ctrl_pdu_len_check(uint8_t len)
+{
+	return len <= (offsetof(struct pdu_data, llctrl) + sizeof(struct pdu_data_llctrl));
+}
+
 static void tx(struct lll_conn *lll, uint32_t at, struct pdu_data *pdu, lll_radio_cb_t cb)
 {
 	evt.cfg.phy = lll_radio_phy(phy_tx_get(lll));
 
+#if defined(CONFIG_BT_CTLR_LE_ENC)
+	if (lll->enc_tx != 0U) {
+		lll_ccm_encrypt(&lll->ccm_tx, pdu, (void *)pdu_enc_tx);
+		pdu = (void *)pdu_enc_tx;
+	}
+#endif /* CONFIG_BT_CTLR_LE_ENC */
+
 	lll_radio_tx(&evt.cfg, at, pdu, cb, lll);
 }
 
-static void isr_rx_pdu(struct lll_conn *lll, struct pdu_data *pdu_rx, uint8_t *is_rx_enqueue,
-		       struct node_tx **tx_release, uint8_t *is_done)
+/* pdu_node is the buffer of the node rx, which is pdu_rx itself unless the PDU
+ * is encrypted.
+ */
+static int isr_rx_pdu(struct lll_conn *lll, struct pdu_data *pdu_rx, struct pdu_data *pdu_node,
+		      uint8_t *is_rx_enqueue, struct node_tx **tx_release, uint8_t *is_done)
 {
 	if (pdu_rx->nesn != lll->sn) {
 		struct pdu_data *pdu_tx;
@@ -281,6 +322,11 @@ static void isr_rx_pdu(struct lll_conn *lll, struct pdu_data *pdu_rx, uint8_t *i
 			pdu_tx = (void *)(tx->pdu + lll->packet_tx_head_offset);
 
 			pdu_tx_len = pdu_tx->len;
+#if defined(CONFIG_BT_CTLR_LE_ENC)
+			if ((pdu_tx_len != 0U) && (lll->enc_tx != 0U)) {
+				lll->ccm_tx.counter++;
+			}
+#endif /* CONFIG_BT_CTLR_LE_ENC */
 
 			offset = lll->packet_tx_head_offset + pdu_tx_len;
 			if (offset < lll->packet_tx_head_len) {
@@ -316,9 +362,44 @@ static void isr_rx_pdu(struct lll_conn *lll, struct pdu_data *pdu_rx, uint8_t *i
 		lll->nesn++;
 
 		if (pdu_rx->len != 0U) {
+#if defined(CONFIG_BT_CTLR_LE_ENC)
+			if (evt.rx_enc != 0U) {
+				bool mic_ok;
+
+				mic_ok = lll_ccm_decrypt(&lll->ccm_rx, pdu_rx, pdu_node);
+
+				if (!mic_ok && (lll->ccm_rx.counter == 0U) &&
+				    (pdu_rx->ll_id == PDU_DATA_LLID_CTRL) &&
+				    ctrl_pdu_len_check(pdu_rx->len)) {
+					/* Received an LL control packet in the
+					 * middle of the LL encryption procedure
+					 * with MIC failure.
+					 * This could be an unencrypted packet
+					 */
+					(void)memcpy(pdu_node, pdu_rx,
+						     offsetof(struct pdu_data, llctrl) +
+						     pdu_rx->len);
+					mic_ok = true;
+					lll->ccm_rx.counter--;
+				}
+
+				if (!mic_ok) {
+					evt.mic_state = LLL_CONN_MIC_FAIL;
+
+					return -EINVAL;
+				}
+
+				lll->ccm_rx.counter++;
+
+				evt.mic_state = LLL_CONN_MIC_PASS;
+			}
+#endif /* CONFIG_BT_CTLR_LE_ENC */
+
 			*is_rx_enqueue = 1U;
 		}
 	}
+
+	return 0;
 }
 
 static struct pdu_data *tx_prep(struct lll_conn *lll)
@@ -451,11 +532,24 @@ static void isr_rx(const struct bsr_evt *e, void *param)
 	node_rx = ull_pdu_rx_alloc_peek(1);
 	LL_ASSERT_DBG(node_rx != NULL);
 
+#if defined(CONFIG_BT_CTLR_LE_ENC)
+	pdu_rx = (evt.rx_enc != 0U) ? (void *)pdu_enc_rx : (void *)node_rx->pdu;
+#else /* !CONFIG_BT_CTLR_LE_ENC */
 	pdu_rx = (void *)node_rx->pdu;
+#endif /* !CONFIG_BT_CTLR_LE_ENC */
 
 	crc_ok = (e->status == BSR_STATUS_OK);
 	if (crc_ok) {
-		isr_rx_pdu(lll, pdu_rx, &is_rx_enqueue, &tx_release, &is_done);
+		int err;
+
+		err = isr_rx_pdu(lll, pdu_rx, (void *)node_rx->pdu, &is_rx_enqueue, &tx_release,
+				 &is_done);
+		if (err != 0) {
+			/* On MIC failure, close the event without responding */
+			is_closed = true;
+
+			goto isr_rx_exit;
+		}
 
 		evt.crc_expire = 0U;
 
@@ -540,6 +634,7 @@ static void rx(struct lll_conn *lll, uint32_t start, uint32_t window_us)
 {
 	struct node_rx_pdu *node_rx;
 	uint16_t max_rx_octets;
+	void *buf;
 
 	node_rx = ull_pdu_rx_alloc_peek(1);
 	LL_ASSERT_DBG(node_rx != NULL);
@@ -558,8 +653,20 @@ static void rx(struct lll_conn *lll, uint32_t start, uint32_t window_us)
 	evt.cfg.phy = lll_radio_phy(phy_rx_get(lll));
 
 	evt.cfg.max_len = max_rx_octets;
+	buf = node_rx->pdu;
 
-	lll_radio_rx(&evt.cfg, start, window_us, node_rx->pdu, isr_rx, lll);
+#if defined(CONFIG_BT_CTLR_LE_ENC)
+	evt.rx_enc = lll->enc_rx;
+	if (evt.rx_enc != 0U) {
+		/* Received into its own buffer, and decrypted into the node rx
+		 * if it is new data.
+		 */
+		evt.cfg.max_len += PDU_MIC_SIZE;
+		buf = pdu_enc_rx;
+	}
+#endif /* CONFIG_BT_CTLR_LE_ENC */
+
+	lll_radio_rx(&evt.cfg, start, window_us, buf, isr_rx, lll);
 }
 
 void lll_conn_central_start(struct lll_conn *lll, uint8_t chan, uint32_t start_us)
@@ -686,6 +793,10 @@ void lll_conn_abort_cb(struct lll_prepare_param *prepare_param, void *param)
 	e->trx_cnt = 0U;
 	e->crc_valid = 0U;
 	e->is_aborted = 1U;
+
+#if defined(CONFIG_BT_CTLR_LE_ENC)
+	e->mic_state = LLL_CONN_MIC_NONE;
+#endif /* CONFIG_BT_CTLR_LE_ENC */
 
 	lll_done(param);
 }
