@@ -22,6 +22,18 @@ zephyr_library_sources_ifdef(CONFIG_BT_OBSERVER
   "lll/lll_scan.c"
 )
 
+if(CONFIG_BT_CONN)
+  zephyr_library_sources(
+    "lll/lll_conn.c"
+  )
+  zephyr_library_sources_ifdef(CONFIG_BT_PERIPHERAL
+    "lll/lll_peripheral.c"
+  )
+  zephyr_library_sources_ifdef(CONFIG_BT_CENTRAL
+    "lll/lll_central.c"
+  )
+endif()
+
 zephyr_library_sources(
   "hal/bsim/cntr.c"
   "hal/bsim/ecb.c"

@@ -37,6 +37,7 @@
 #include "lll_adv.h"
 #include "lll_adv_pdu.h"
 #include "lll_df_types.h"
+#include "lll_conn.h"
 #include "lll_filter.h"
 
 #include "lll_internal.h"
@@ -68,6 +69,24 @@ int lll_adv_reset(void)
 {
 	return lll_adv_pdu_init_reset();
 }
+
+#if defined(CONFIG_BT_PERIPHERAL)
+/* The advertising stops once connected, so any of its events in the prepare
+ * pipeline are aborted too.
+ */
+static void event_close_all(struct lll_adv *lll)
+{
+	static memq_link_t link;
+	static struct mayfly mfy = { 0, 0, &link, NULL, lll_disable };
+	uint32_t ret;
+
+	lll_isr_cleanup(lll);
+
+	mfy.param = lll;
+	ret = mayfly_enqueue(TICKER_USER_ID_LLL, TICKER_USER_ID_LLL, 1U, &mfy);
+	LL_ASSERT_ERR(ret == 0U);
+}
+#endif /* CONFIG_BT_PERIPHERAL */
 
 #if defined(CONFIG_BT_CTLR_SCAN_REQ_NOTIFY)
 static int scan_req_report(struct lll_adv *lll, const struct bsr_evt *e)
@@ -121,13 +140,32 @@ static void chan_tx(struct lll_adv *lll, uint32_t at)
 	lll_radio_tx(&evt.cfg, at, pdu, isr_tx, lll);
 }
 
+static bool is_cancelled(const struct lll_adv *lll)
+{
+#if defined(CONFIG_BT_PERIPHERAL)
+	return (lll->conn != NULL) && (lll->conn->periph.cancelled != 0U);
+#else /* !CONFIG_BT_PERIPHERAL */
+	return false;
+#endif /* !CONFIG_BT_PERIPHERAL */
+}
+
 static void isr_done(const struct bsr_evt *e, void *param)
 {
 	struct lll_adv *lll = param;
 
 	ARG_UNUSED(e);
 
-	if (lll->chan_map_curr != 0U) {
+#if defined(CONFIG_BT_PERIPHERAL)
+	if (!IS_ENABLED(CONFIG_BT_CTLR_LOW_LAT) && (lll->is_hdcd != 0U) &&
+	    (lll->chan_map_curr == 0U)) {
+		lll->chan_map_curr = lll->chan_map;
+	}
+#endif /* CONFIG_BT_PERIPHERAL */
+
+	/* Do not continue connectable advertising if advertising is being
+	 * disabled, i.e. the cancelled flag is set.
+	 */
+	if ((lll->chan_map_curr != 0U) && !is_cancelled(lll)) {
 		chan_tx(lll, lll_radio_now() + ADV_CHAN_SWITCH_US);
 
 		return;
@@ -199,6 +237,60 @@ static int isr_rx_pdu(struct lll_adv *lll, const struct bsr_evt *e, struct pdu_a
 		return 0;
 	}
 
+#if defined(CONFIG_BT_PERIPHERAL)
+	/* A CONNECT_IND is not accepted once the advertising is being disabled
+	 * (cancelled flag set in thread context), so that the thread does not
+	 * race with the initiated flag set here. The central then sees a failed
+	 * connection establishment, which keeps the disabling simple.
+	 */
+	if ((pdu_rx->type == PDU_ADV_TYPE_CONNECT_IND) &&
+	    (pdu_rx->len == sizeof(struct pdu_adv_connect_ind)) && (lll->conn != NULL) &&
+	    (lll->conn->periph.cancelled == 0U) &&
+	    lll_adv_connect_ind_check(lll, pdu_rx, tx_addr, addr, rx_addr, tgt_addr,
+				      match->devmatch_ok, &rl_idx)) {
+		struct node_rx_ftr *ftr;
+		struct node_rx_pdu *rx;
+
+		if (IS_ENABLED(CONFIG_BT_CTLR_CHAN_SEL_2)) {
+			rx = ull_pdu_rx_alloc_peek(4);
+		} else {
+			rx = ull_pdu_rx_alloc_peek(3);
+		}
+
+		if (rx == NULL) {
+			return -ENOBUFS;
+		}
+
+#if defined(CONFIG_BT_CTLR_CONN_RSSI)
+		lll->conn->rssi_latest = lll_rssi_get(e->rssi);
+#endif /* CONFIG_BT_CTLR_CONN_RSSI */
+
+		/* Stop further LLL radio events */
+		lll->conn->periph.initiated = 1U;
+
+		/* The CONNECT_IND is in the node rx PDU */
+		rx = ull_pdu_rx_alloc();
+
+		rx->hdr.type = NODE_RX_TYPE_CONNECTION;
+		rx->hdr.handle = LLL_HANDLE_INVALID;
+
+		ftr = &rx->rx_ftr;
+		ftr->param = lll;
+		ftr->ticks_anchor = evt.ticks_ref;
+		ftr->radio_end_us = e->ts_end - HAL_TICKER_TICKS_TO_US(evt.ticks_ref);
+
+		if (IS_ENABLED(CONFIG_BT_CTLR_CHAN_SEL_2)) {
+			ftr->extra = ull_pdu_rx_alloc();
+		}
+
+		ull_rx_put_sched(rx->hdr.link, rx);
+
+		event_close_all(lll);
+
+		return 0;
+	}
+#endif /* CONFIG_BT_PERIPHERAL */
+
 	return -EINVAL;
 }
 
@@ -255,6 +347,18 @@ static int prepare_cb(struct lll_prepare_param *p)
 
 	DEBUG_RADIO_START_A(1);
 
+#if defined(CONFIG_BT_PERIPHERAL)
+	/* Not started if stopped on connection establishment, or when being
+	 * disabled while connectable (cancelled flag set in thread context).
+	 */
+	if (unlikely((lll->conn != NULL) && ((lll->conn->periph.initiated != 0U) ||
+					     (lll->conn->periph.cancelled != 0U)))) {
+		lll_event_abort(lll);
+
+		return 0;
+	}
+#endif /* CONFIG_BT_PERIPHERAL */
+
 	overhead = lll_preempt_calc(p);
 	if (overhead != 0U) {
 		LL_ASSERT_OVERHEAD(overhead);
@@ -292,11 +396,48 @@ static int prepare_cb(struct lll_prepare_param *p)
 	return 0;
 }
 
+#if defined(CONFIG_BT_PERIPHERAL)
+static int resume_prepare_cb(struct lll_prepare_param *p)
+{
+	lll_resume_param_set(p);
+
+	return prepare_cb(p);
+}
+#endif /* CONFIG_BT_PERIPHERAL */
+
 static int is_abort_cb(void *next, void *curr, lll_prepare_cb_t *resume_cb)
 {
-	/* Cutting an advertising event short only delays the advertising, so
-	 * it always gives way and is not resumed.
-	 */
+#if defined(CONFIG_BT_PERIPHERAL)
+	struct lll_adv *lll = curr;
+	struct pdu_adv *pdu;
+#endif /* CONFIG_BT_PERIPHERAL */
+
+	if (next != curr) {
+#if defined(CONFIG_BT_PERIPHERAL)
+		if (lll->is_hdcd != 0U) {
+			int err;
+
+			*resume_cb = resume_prepare_cb;
+
+			/* Keep the HF clock on until the resume */
+			err = lll_hfclock_on();
+			LL_ASSERT_ERR(err >= 0);
+
+			return -EAGAIN;
+		}
+#endif /* CONFIG_BT_PERIPHERAL */
+
+		return -ECANCELED;
+	}
+
+#if defined(CONFIG_BT_PERIPHERAL)
+	/* A directed advertising event continues over its next prepare */
+	pdu = lll_adv_data_curr_get(lll);
+	if (pdu->type == PDU_ADV_TYPE_DIRECT_IND) {
+		return 0;
+	}
+#endif /* CONFIG_BT_PERIPHERAL */
+
 	return -ECANCELED;
 }
 
