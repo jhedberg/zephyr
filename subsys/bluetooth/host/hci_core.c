@@ -2261,48 +2261,6 @@ void bt_hci_conn_lost(struct bt_conn *conn, uint8_t reason)
 	hci_conn_disconnected(bt_conn_ref(conn));
 }
 
-int bt_hci_le_read_remote_features(struct bt_conn *conn)
-{
-	struct bt_hci_cp_le_read_remote_features *cp;
-	struct net_buf *buf;
-
-	buf = bt_hci_cmd_alloc(K_FOREVER);
-	if (!buf) {
-		return -ENOBUFS;
-	}
-
-	cp = net_buf_add(buf, sizeof(*cp));
-	cp->handle = sys_cpu_to_le16(conn->handle);
-	/* Results in BT_HCI_EVT_LE_REMOTE_FEAT_COMPLETE */
-	return bt_hci_cmd_send_sync(BT_HCI_OP_LE_READ_REMOTE_FEATURES, buf, NULL);
-}
-
-int bt_hci_read_remote_version(struct bt_conn *conn)
-{
-	struct bt_hci_cp_read_remote_version_info *cp;
-	struct net_buf *buf;
-
-	if (conn->state != BT_CONN_CONNECTED) {
-		return -ENOTCONN;
-	}
-
-	/* Remote version cannot change. */
-	if (atomic_test_bit(conn->flags, BT_CONN_AUTO_VERSION_INFO)) {
-		return 0;
-	}
-
-	buf = bt_hci_cmd_alloc(K_FOREVER);
-	if (!buf) {
-		return -ENOBUFS;
-	}
-
-	cp = net_buf_add(buf, sizeof(*cp));
-	cp->handle = sys_cpu_to_le16(conn->handle);
-
-	return bt_hci_cmd_send_sync(BT_HCI_OP_READ_REMOTE_VERSION_INFO, buf,
-				    NULL);
-}
-
 /* LE Data Length Change Event is optional so this function just ignore
  * error and stack will continue to use default values.
  */
@@ -5232,6 +5190,15 @@ static int le_init(void)
 		if (err) {
 			return err;
 		}
+
+#if defined(CONFIG_BT_AUTO_DATA_LEN_UPDATE)
+		/* For the connections of a controller that does not update
+		 * the data length on its own. bt_dev only has room for them
+		 * with the option.
+		 */
+		bt_dev.le.max_tx_octets = tx_octets;
+		bt_dev.le.max_tx_time = tx_time;
+#endif /* CONFIG_BT_AUTO_DATA_LEN_UPDATE */
 
 		buf = bt_hci_cmd_alloc(K_FOREVER);
 		if (!buf) {
