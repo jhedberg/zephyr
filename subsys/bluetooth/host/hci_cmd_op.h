@@ -24,6 +24,7 @@
  */
 
 struct bt_hci_cmd_op;
+struct bt_hci_cmd_state_set;
 
 /** @brief Parameter encoder of an asynchronous HCI command.
  *
@@ -145,17 +146,118 @@ struct bt_hci_cmd_op {
 	/** @cond INTERNAL_HIDDEN */
 	sys_snode_t node;
 	const struct bt_hci_cmd_desc *desc;
-	uint8_t state;
-	uint8_t kind;
+	uint8_t state:4,
+		kind:3,
+		seq:1;
+	uint8_t step;
 	uint8_t status;
 	uint8_t err;
 	/** @endcond */
 };
 
+/** @brief What the encoder of a step returns to leave its command out.
+ *
+ *  See struct bt_hci_cmd_step.
+ */
+#define BT_HCI_CMD_SKIP 1
+
+/** @brief One command of a sequence, see struct bt_hci_cmd_seq. */
+struct bt_hci_cmd_step {
+	/** Command OpCode */
+	uint16_t opcode;
+	/** Parameter encoder, or NULL for a command without parameters. It
+	 *  may also return BT_HCI_CMD_SKIP, without having added anything,
+	 *  when the step has nothing to send: the sequence goes on with the
+	 *  next one.
+	 */
+	bt_hci_cmd_encode_t encode;
+	/** Flag that the Host keeps of what the command changes, or NULL.
+	 *  It gets its value when the controller responds to the command with
+	 *  success, whatever becomes of the sequence after that, and before
+	 *  anything that the controller sends after that response is processed.
+	 */
+	const struct bt_hci_cmd_state_set *state;
+	/** Handler of the return parameters, or NULL when they are not wanted.
+	 *  It is called before the flag of the step is applied and before the
+	 *  next step is encoded, which sees what it has kept, and it can end
+	 *  the sequence, see bt_hci_cmd_rsp_t.
+	 */
+	bt_hci_cmd_rsp_t rsp;
+};
+
+/** @brief Description of a sequence of HCI commands.
+ *
+ *  For a procedure that takes several commands, such as setting parameters
+ *  and then enabling what they are for. One operation goes through the steps
+ *  in order and completes once: with the result of the first command that
+ *  failed, or that the handler of its step ended the sequence with, after
+ *  which nothing more of the sequence is sent, or with 0 after the last one.
+ *  bt_hci_cmd_op_step() tells how far it got. No other command is sent
+ *  between two commands of a sequence.
+ *
+ *  Every command is encoded when it is its turn: an encoder sees what the
+ *  commands before it have changed, and what the handlers of their steps have
+ *  kept of their return parameters. The command engine takes the operation
+ *  from one step to the next. Nothing in between needs the Bluetooth
+ *  workqueue, so a completion through a future can be waited for there, as
+ *  that of a single command can.
+ *
+ *  What the Host keeps of the controller follows the responses of the
+ *  controller, not the encoders. A sequence can end between any two of its
+ *  commands, by a failure or by a cancel, so an encoder never records what
+ *  the command before it has done. A step names the flag that its command
+ *  changes instead, see bt_hci_cmd_step.state. For a value that a command
+ *  sets, the flag says that the copy that the Host has of the value is what
+ *  the controller has: the encoder of the step clears the flag, writes the
+ *  copy and adds it to the command, and the response of the controller sets
+ *  the flag again. The same encoder leaves its command out when the copy has
+ *  the flag and the value that is wanted. The copy is state that the host
+ *  lock protects, which every encoder runs with.
+ *
+ *  Define the description and its steps as constants with static storage
+ *  duration, and send the operation with one of the bt_hci_cmd_send_seq_*()
+ *  calls:
+ *
+ *  @code{.c}
+ *  static const struct bt_hci_cmd_step foo_start_steps[] = {
+ *          { BT_HCI_OP_SET_FOO_PARAM, foo_param_encode },
+ *          { BT_HCI_OP_SET_FOO_ENABLE, foo_enable_encode, &foo_enabled },
+ *  };
+ *
+ *  static const struct bt_hci_cmd_seq foo_start =
+ *          BT_HCI_CMD_SEQ_INIT(foo_start_steps, foo_start_done);
+ *
+ *  err = bt_hci_cmd_send_seq_cb(&foo->op, &foo_start);
+ *  @endcode
+ */
+struct bt_hci_cmd_seq {
+	/** What the operation of a sequence has for a description. Only the
+	 *  completion callback is used of it, which is told once.
+	 */
+	struct bt_hci_cmd_desc desc;
+	/** The commands, in the order in which they are sent */
+	const struct bt_hci_cmd_step *steps;
+	/** Number of commands */
+	uint8_t num_steps;
+};
+
+/** @brief Initializer of a struct bt_hci_cmd_seq.
+ *
+ *  @param _steps Array of struct bt_hci_cmd_step.
+ *  @param _done  Completion callback, see bt_hci_cmd_desc.done.
+ */
+#define BT_HCI_CMD_SEQ_INIT(_steps, _done)                                                         \
+	{                                                                                          \
+		.desc = { .done = (_done) },                                                       \
+		.steps = (_steps),                                                                 \
+		.num_steps = ARRAY_SIZE(_steps),                                                   \
+	}
+
 /** @brief Operation whose completion resolves a future.
  *
- *  For bt_hci_cmd_send_async(). The future is part of the object, as it
- *  stays with the command engine for as long as the operation does.
+ *  For bt_hci_cmd_send_async() and bt_hci_cmd_send_seq_async(). The future
+ *  is part of the object, as it stays with the command engine for as long as
+ *  the operation does.
  */
 struct bt_hci_cmd_op_fut {
 	/** Resolved with the result of the command */
@@ -254,6 +356,49 @@ int bt_hci_cmd_send_cb(struct bt_hci_cmd_op *op, const struct bt_hci_cmd_desc *d
  */
 int bt_hci_cmd_send_async(struct bt_hci_cmd_op_fut *req, const struct bt_hci_cmd_desc *desc);
 
+/** @brief Send a sequence of HCI commands and get its completion through a
+ *         callback.
+ *
+ *  As bt_hci_cmd_send_cb(), for the commands of @p seq. The callback is told
+ *  once, see struct bt_hci_cmd_seq. The return parameters of a command go to
+ *  the handler of its step, if it has one.
+ *
+ *  After a call that returns 0, @p op and what the encoders and the handlers
+ *  of the steps use belong to the command engine until the callback is
+ *  invoked or bt_hci_cmd_op_cancel() returns 0. @p op is therefore part of
+ *  the object that the sequence is about, as for bt_hci_cmd_send_cb().
+ *
+ *  @param op  Operation, idle: all zeroes, or handed back by an earlier send.
+ *  @param seq Description of the sequence. It, its steps and the flags that
+ *             they name have to stay valid until the completion is handed
+ *             back.
+ *
+ *  @return As bt_hci_cmd_send_cb().
+ */
+int bt_hci_cmd_send_seq_cb(struct bt_hci_cmd_op *op, const struct bt_hci_cmd_seq *seq);
+
+/** @brief Send a sequence of HCI commands and get its completion through a
+ *         future.
+ *
+ *  As bt_hci_cmd_send_async(), for the commands of @p seq. @p req is part of
+ *  the object that the sequence is about, as for bt_hci_cmd_send_seq_cb().
+ *  It and what the encoders and the handlers of the steps use belong to the
+ *  command engine until its future is resolved or bt_hci_cmd_op_cancel()
+ *  returns 0, and the future has to stay valid after that until its result
+ *  has been collected.
+ *
+ *  A sequence has no synchronous send call: a function that waits for one
+ *  where it sends it has @p req on its stack, under the rules that
+ *  bt_hci_cmd_send_async() gives for an operation there.
+ *
+ *  @param req Operation with its future, idle: all zeroes, or handed back by
+ *             an earlier send.
+ *  @param seq Description of the sequence, as for bt_hci_cmd_send_seq_cb().
+ *
+ *  @return As bt_hci_cmd_send_cb().
+ */
+int bt_hci_cmd_send_seq_async(struct bt_hci_cmd_op_fut *req, const struct bt_hci_cmd_seq *seq);
+
 /** @brief Wait for an operation and get what a synchronous command returns.
  *
  *  For a function that waits for an operation it has sent and returns what
@@ -268,7 +413,7 @@ int bt_hci_cmd_send_async(struct bt_hci_cmd_op_fut *req, const struct bt_hci_cmd
  *  bt_hci_cmd_send_sync(), an assert. bt_hci_cmd_op_status() still gives the
  *  status that the controller responded with.
  *
- *  @param op Operation that bt_hci_cmd_send_async() has accepted.
+ *  @param op Operation that a send call with a future has accepted.
  *
  *  @return 0 on success, or a negative error number: one of those below, or
  *          another negative result of bt_hci_cmd_send_cb().
@@ -344,6 +489,20 @@ int bt_hci_cmd_op_cancel(struct bt_hci_cmd_op *op);
 static inline const struct bt_hci_cmd_desc *bt_hci_cmd_op_desc(const struct bt_hci_cmd_op *op)
 {
 	return op->desc;
+}
+
+/** @brief How far an operation has got in a sequence of commands.
+ *
+ *  @param op Operation that was sent with a struct bt_hci_cmd_seq.
+ *
+ *  @return In the encoder of a step, the index of that step. In a completion,
+ *          the number of steps that the sequence has got through: all of them
+ *          for a result of 0, and otherwise the index of the step that the
+ *          result is about.
+ */
+static inline uint8_t bt_hci_cmd_op_step(const struct bt_hci_cmd_op *op)
+{
+	return op->step;
 }
 
 /** @brief Controller status of the last completion of an operation.
