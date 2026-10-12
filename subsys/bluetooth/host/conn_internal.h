@@ -110,6 +110,7 @@ enum {
 	 * commands are sent in the order that they have here.
 	 */
 	BT_CONN_CMD_DISCONNECT,               /* HCI Disconnect */
+	BT_CONN_CMD_CONN_UPDATE,              /* HCI LE Connection Update */
 	BT_CONN_CMD_BUSY,                     /* One of the commands is on its way */
 
 	/* Total number of flags - must be at the end of the enum */
@@ -531,8 +532,18 @@ void bt_conn_br_role_changed(struct bt_conn *conn, uint8_t status);
 
 void bt_conn_br_packet_type_changed(struct bt_conn *conn, uint8_t status, uint16_t packet_type);
 
+/* Send an HCI LE Connection Update command and wait for the response of
+ * the controller, which is returned as by bt_hci_cmd_send_sync(). -ENOTCONN
+ * if the connection is gone.
+ */
 int bt_conn_le_conn_update(struct bt_conn *conn,
 			   const struct bt_le_conn_param *param);
+
+/* The same for an update that the Host starts on its own and that nobody
+ * waits for. The call does not block, of several requests that have not been
+ * sent yet the last one counts, and a refusal of the controller is logged.
+ */
+int bt_conn_le_conn_update_nowait(struct bt_conn *conn, const struct bt_le_conn_param *param);
 
 void bt_conn_notify_remote_info(struct bt_conn *conn);
 
