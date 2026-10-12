@@ -38,6 +38,10 @@ struct test_cmd_script {
 	bool echo;
 	/** What send() returns instead of taking the command, if not 0 */
 	int send_err;
+	/** The controller keeps the buffer of the command, as a driver may,
+	 *  until the next test_driver_reset() (test_other only)
+	 */
+	bool keep;
 	/** How often the controller has been given the command */
 	unsigned int count;
 };

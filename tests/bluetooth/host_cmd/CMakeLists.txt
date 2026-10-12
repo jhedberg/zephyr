@@ -12,6 +12,7 @@ target_sources(app PRIVATE
   src/deadline.c
   src/disconnect.c
   src/op.c
+  src/seq.c
 )
 
 # A suite for a central with SMP, which one scenario is
