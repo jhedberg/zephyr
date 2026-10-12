@@ -146,6 +146,36 @@ int bt_smp_start_security(struct bt_conn *conn);
 bool bt_smp_request_ltk(struct bt_conn *conn, uint64_t rand, uint16_t ediv,
 			uint8_t *ltk);
 
+struct bt_hci_cp_le_start_encryption;
+
+/** @brief Key for the HCI LE Start Encryption command of a connection.
+ *
+ *  Called when the command that bt_conn_le_start_encryption() asked for is
+ *  sent, under the conditions of an HCI command encoder: with the host lock
+ *  held, it only fills in the parameters, from what SMP has put aside for the
+ *  command with that lock held.
+ *
+ *  @param conn Connection.
+ *  @param cp   Parameters of the command, zeroed. The random number, the
+ *              encrypted diversifier and the key are filled in.
+ *
+ *  @retval 0 The parameters have been filled in.
+ *  @retval -ENOTCONN The connection is gone.
+ *  @retval -ECANCELED Encryption is no longer wanted.
+ */
+int bt_smp_enc_params(struct bt_conn *conn, struct bt_hci_cp_le_start_encryption *cp);
+
+/** @brief The HCI LE Start Encryption command of a connection has failed.
+ *
+ *  For a command that bt_conn_le_start_encryption() asked for without waiting
+ *  for it, and that the controller refused or that was not sent to it. Called
+ *  on the Bluetooth workqueue. SMP treats it as an error of the procedure
+ *  that it started encryption for.
+ *
+ *  @param conn Connection.
+ */
+void bt_smp_enc_failed(struct bt_conn *conn);
+
 void bt_smp_update_keys(struct bt_conn *conn);
 
 int bt_smp_br_send_pairing_req(struct bt_conn *conn);
