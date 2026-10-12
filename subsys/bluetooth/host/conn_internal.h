@@ -85,7 +85,6 @@ enum {
 	BT_CONN_BR_PAIRING_INITIATOR,         /* local host starts authentication */
 	BT_CONN_CLEANUP,                      /* Disconnected, pending cleanup */
 	BT_CONN_TX_FAILED,                    /* Sending failed, pending disconnect */
-	BT_CONN_AUTO_INIT_PROCEDURES_DONE,    /* Auto-initiated procedures have run */
 	BT_CONN_PERIPHERAL_PARAM_UPDATE,      /* If periph param update timer fired */
 	BT_CONN_PERIPHERAL_PARAM_AUTO_UPDATE, /* If periph param auto update on timer fired */
 	BT_CONN_PERIPHERAL_PARAM_SET,         /* If periph param were set from app */
@@ -110,6 +109,10 @@ enum {
 	 * commands are sent in the order that they have here.
 	 */
 	BT_CONN_CMD_DISCONNECT,               /* HCI Disconnect */
+	BT_CONN_CMD_REMOTE_FEATURES,          /* HCI LE Read Remote Features */
+	BT_CONN_CMD_REMOTE_VERSION,           /* HCI Read Remote Version Information */
+	BT_CONN_CMD_AUTO_PHY,                 /* HCI LE Set PHY, to the automatic preference */
+	BT_CONN_CMD_AUTO_DATA_LEN,            /* HCI LE Set Data Length, to the maximum */
 	BT_CONN_CMD_CONN_UPDATE,              /* HCI LE Connection Update */
 	BT_CONN_CMD_BUSY,                     /* One of the commands is on its way */
 
