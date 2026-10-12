@@ -8,10 +8,16 @@ project(host_cmd)
 
 target_sources(app PRIVATE
   src/driver.c
+  src/conn_cmds.c
   src/deadline.c
   src/disconnect.c
   src/op.c
 )
+
+# A suite for a central with SMP, which one scenario is
+if(CONFIG_BT_SMP AND CONFIG_BT_CENTRAL)
+  target_sources(app PRIVATE src/encrypt.c)
+endif()
 
 # The asynchronous command API is internal to the Host
 target_include_directories(app PRIVATE ${ZEPHYR_BASE}/subsys/bluetooth/host)
