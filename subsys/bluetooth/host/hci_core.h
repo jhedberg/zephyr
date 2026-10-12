@@ -335,6 +335,11 @@ struct bt_dev_le {
 #if defined(CONFIG_BT_CONN)
 	/* Controller buffer information */
 	uint16_t		acl_mtu;
+#if defined(CONFIG_BT_AUTO_DATA_LEN_UPDATE)
+	/* What HCI LE Read Maximum Data Length gave at initialization */
+	uint16_t		max_tx_octets;
+	uint16_t		max_tx_time;
+#endif /* CONFIG_BT_AUTO_DATA_LEN_UPDATE */
 	struct k_sem		acl_pkts;
 #endif /* CONFIG_BT_CONN */
 #if defined(CONFIG_BT_ISO)
@@ -677,8 +682,6 @@ void bt_hci_le_df_cte_req_failed(struct net_buf *buf);
 void bt_hci_le_per_adv_subevent_data_request(struct net_buf *buf);
 void bt_hci_le_per_adv_response_report(struct net_buf *buf);
 
-int bt_hci_read_remote_version(struct bt_conn *conn);
-int bt_hci_le_read_remote_features(struct bt_conn *conn);
 int bt_hci_le_read_max_data_len(uint16_t *tx_octets, uint16_t *tx_time);
 
 bool bt_drv_quirk_no_auto_dle(void);

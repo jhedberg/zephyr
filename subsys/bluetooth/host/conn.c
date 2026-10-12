@@ -2072,6 +2072,61 @@ static void disconnect_done(struct bt_conn *conn, int result)
 	}
 }
 
+/* The parameters of a command that only names its connection, which has to
+ * be up.
+ */
+static int conn_handle_encode(struct bt_conn *conn, struct net_buf *buf)
+{
+	if (conn->state != BT_CONN_CONNECTED) {
+		return -ENOTCONN;
+	}
+
+	net_buf_add_le16(buf, conn->handle);
+
+	return 0;
+}
+
+static int auto_phy_encode(struct bt_conn *conn, struct net_buf *buf)
+{
+	uint8_t pref = (conn->role == BT_HCI_ROLE_CENTRAL) ? AUTO_PHY_CENTRAL_PREF
+							   : AUTO_PHY_PERIPHERAL_PREF;
+	struct bt_hci_cp_le_set_phy *cp;
+
+	if (conn->state != BT_CONN_CONNECTED) {
+		return -ENOTCONN;
+	}
+
+	cp = net_buf_add(buf, sizeof(*cp));
+	cp->handle = sys_cpu_to_le16(conn->handle);
+	cp->all_phys = 0U;
+	cp->tx_phys = pref;
+	cp->rx_phys = pref;
+	cp->phy_opts = sys_cpu_to_le16(BT_HCI_LE_PHY_CODED_ANY);
+
+	return 0;
+}
+
+#if defined(CONFIG_BT_AUTO_DATA_LEN_UPDATE)
+static int auto_data_len_encode(struct bt_conn *conn, struct net_buf *buf)
+{
+	struct bt_hci_cp_le_set_data_len *cp;
+
+	if (conn->state != BT_CONN_CONNECTED) {
+		return -ENOTCONN;
+	}
+
+	cp = net_buf_add(buf, sizeof(*cp));
+	cp->handle = sys_cpu_to_le16(conn->handle);
+	cp->tx_octets = sys_cpu_to_le16(bt_dev.le.max_tx_octets);
+	cp->tx_time = sys_cpu_to_le16(bt_dev.le.max_tx_time);
+
+	return 0;
+}
+#else
+/* bt_dev only keeps the maximum data length with the option */
+#define auto_data_len_encode NULL
+#endif /* CONFIG_BT_AUTO_DATA_LEN_UPDATE */
+
 /* Add the parameters of an HCI LE Connection Update command */
 static int conn_update_add(struct bt_conn *conn, struct net_buf *buf,
 			   const struct bt_le_conn_param *param)
@@ -2122,9 +2177,22 @@ static void conn_update_done(struct bt_conn *conn, int result)
 	atomic_clear_bit(conn->flags, BT_CONN_PERIPHERAL_PARAM_AUTO_UPDATE);
 }
 
+/* The commands of a connection, by their flags. One that is not part of the
+ * build has no functions here, and nothing else refers to them either.
+ */
 static const struct conn_cmd conn_cmds[] = {
 	[BT_CONN_CMD_DISCONNECT - BT_CONN_CMD_FIRST] =
 		CONN_CMD(BT_HCI_OP_DISCONNECT, disconnect_encode, disconnect_done),
+	/* Results in an LE Read Remote Features Complete event */
+	[BT_CONN_CMD_REMOTE_FEATURES - BT_CONN_CMD_FIRST] =
+		CONN_CMD(BT_HCI_OP_LE_READ_REMOTE_FEATURES, conn_handle_encode, NULL),
+	[BT_CONN_CMD_REMOTE_VERSION - BT_CONN_CMD_FIRST] =
+		CONN_CMD(BT_HCI_OP_READ_REMOTE_VERSION_INFO, conn_handle_encode, NULL),
+	[BT_CONN_CMD_AUTO_PHY - BT_CONN_CMD_FIRST] =
+		CONN_CMD(BT_HCI_OP_LE_SET_PHY,
+			 IS_ENABLED(CONFIG_BT_PHY_UPDATE) ? auto_phy_encode : NULL, NULL),
+	[BT_CONN_CMD_AUTO_DATA_LEN - BT_CONN_CMD_FIRST] =
+		CONN_CMD(BT_HCI_OP_LE_SET_DATA_LEN, auto_data_len_encode, NULL),
 	[BT_CONN_CMD_CONN_UPDATE - BT_CONN_CMD_FIRST] =
 		CONN_CMD(BT_HCI_OP_LE_CONN_UPDATE, conn_update_encode, conn_update_done),
 };
@@ -2289,21 +2357,19 @@ static int conn_req_wait(struct bt_hci_cmd_op_fut *req)
 
 static int do_phy_update(struct bt_conn *conn)
 {
-	uint8_t phy, pref;
+	uint8_t phy;
 	bool supported;
 
 	switch (conn->role) {
 #if !defined(CONFIG_BT_AUTO_PHY_CENTRAL_NONE)
 	case BT_HCI_ROLE_CENTRAL:
 		phy = AUTO_PHY_CENTRAL;
-		pref = AUTO_PHY_CENTRAL_PREF;
 		supported = AUTO_PHY_CENTRAL_SUPPORTED(bt_dev.le.features);
 		break;
 #endif
 #if !defined(CONFIG_BT_AUTO_PHY_PERIPHERAL_NONE)
 	case BT_HCI_ROLE_PERIPHERAL:
 		phy = AUTO_PHY_PERIPHERAL;
-		pref = AUTO_PHY_PERIPHERAL_PREF;
 		supported = AUTO_PHY_PERIPHERAL_SUPPORTED(bt_dev.le.features);
 		break;
 #endif
@@ -2327,7 +2393,7 @@ static int do_phy_update(struct bt_conn *conn)
 	}
 #endif
 
-	return bt_le_set_phy(conn, 0U, pref, pref, BT_HCI_LE_PHY_CODED_ANY);
+	return conn_cmd_request(conn, BT_CONN_CMD_AUTO_PHY);
 }
 
 static bool can_initiate_feature_exchange(struct bt_conn *conn)
@@ -2351,46 +2417,35 @@ static bool can_initiate_feature_exchange(struct bt_conn *conn)
 	return BT_FEAT_LE_PER_INIT_FEAT_XCHG(bt_dev.le.features);
 }
 
-static void perform_auto_initiated_procedures(struct bt_conn *conn, void *unused)
+/* Starts the procedures that follow the establishment of a connection:
+ * - read remote features
+ * - read remote version
+ * - update PHY
+ * - update data length
+ *
+ * Their commands are sent one after the other through the command operation
+ * of the connection, which blocks nothing: there is no need to leave this to
+ * a work item. A command that the controller refuses is logged.
+ */
+static void auto_initiated_procedures(struct bt_conn *conn)
 {
 	int err;
 
-	ARG_UNUSED(unused);
-
 	LOG_DBG("[%p] Running auto-initiated procedures", conn);
-
-	if (conn->state != BT_CONN_CONNECTED) {
-		/* It is possible that connection was disconnected directly from
-		 * connected callback so we must check state before doing
-		 * connection parameters update.
-		 */
-		return;
-	}
-
-	if (atomic_test_and_set_bit(conn->flags, BT_CONN_AUTO_INIT_PROCEDURES_DONE)) {
-		/* We have already run the auto-initiated procedures */
-		return;
-	}
 
 	if (!atomic_test_bit(conn->flags, BT_CONN_LE_FEATURES_EXCHANGED) &&
 	    can_initiate_feature_exchange(conn)) {
-		err = bt_hci_le_read_remote_features(conn);
-		if (err) {
-			LOG_ERR("Failed read remote features (%d)", err);
-		}
-		if (conn->state != BT_CONN_CONNECTED) {
-			return;
+		err = conn_cmd_request(conn, BT_CONN_CMD_REMOTE_FEATURES);
+		if (err != 0) {
+			goto refused;
 		}
 	}
 
 	if (IS_ENABLED(CONFIG_BT_REMOTE_VERSION) &&
 	    !atomic_test_bit(conn->flags, BT_CONN_AUTO_VERSION_INFO)) {
-		err = bt_hci_read_remote_version(conn);
-		if (err) {
-			LOG_ERR("Failed read remote version (%d)", err);
-		}
-		if (conn->state != BT_CONN_CONNECTED) {
-			return;
+		err = conn_cmd_request(conn, BT_CONN_CMD_REMOTE_VERSION);
+		if (err != 0) {
+			goto refused;
 		}
 	}
 
@@ -2398,12 +2453,8 @@ static void perform_auto_initiated_procedures(struct bt_conn *conn, void *unused
 	    (!IS_ENABLED(CONFIG_BT_AUTO_PHY_CENTRAL_NONE) ||
 	     !IS_ENABLED(CONFIG_BT_AUTO_PHY_PERIPHERAL_NONE))) {
 		err = do_phy_update(conn);
-		if (err) {
-			LOG_ERR("Failed LE Set PHY (%d)", err);
-		}
-
-		if (conn->state != BT_CONN_CONNECTED) {
-			return;
+		if (err != 0) {
+			goto refused;
 		}
 	}
 
@@ -2412,46 +2463,32 @@ static void perform_auto_initiated_procedures(struct bt_conn *conn, void *unused
 	 */
 	if (IS_ENABLED(CONFIG_BT_AUTO_DATA_LEN_UPDATE) && BT_FEAT_LE_DLE(bt_dev.le.features) &&
 	    bt_drv_quirk_no_auto_dle()) {
-		uint16_t tx_octets, tx_time;
-
-		err = bt_hci_le_read_max_data_len(&tx_octets, &tx_time);
-		if (!err) {
-			err = bt_le_set_data_len(conn, tx_octets, tx_time);
-			if (err) {
-				LOG_ERR("Failed to set data len (%d)", err);
-			}
+		err = conn_cmd_request(conn, BT_CONN_CMD_AUTO_DATA_LEN);
+		if (err != 0) {
+			goto refused;
 		}
 	}
 
-	LOG_DBG("[%p] Successfully ran auto-initiated procedures", conn);
-}
+	return;
 
-/* Executes procedures after a connection is established:
- * - read remote features
- * - read remote version
- * - update PHY
- * - update data length
- */
-static void auto_initiated_procedures(struct k_work *unused)
-{
-	ARG_UNUSED(unused);
-
-	bt_conn_foreach(BT_CONN_TYPE_LE, perform_auto_initiated_procedures, NULL);
-}
-
-static K_WORK_DEFINE(procedures_on_connect, auto_initiated_procedures);
-
-static void schedule_auto_initiated_procedures(struct bt_conn *conn)
-{
-	LOG_DBG("[%p] Scheduling auto-init procedures", conn);
-	bt_work_submit(&procedures_on_connect);
+refused:
+	/* The commands after a refused one would be refused as well. A
+	 * connection that is no longer up is not worth a word: a connected
+	 * callback may have disconnected it. Anything else is.
+	 */
+	if (err != -ENOTCONN) {
+		LOG_WRN("[%p] Auto-initiated procedures stopped (%d)", conn, err);
+	}
 }
 
 void bt_conn_connected(struct bt_conn *conn)
 {
-	schedule_auto_initiated_procedures(conn);
 	bt_l2cap_connected(conn);
 	notify_connected(conn);
+
+	if (bt_conn_is_le(conn)) {
+		auto_initiated_procedures(conn);
+	}
 }
 
 #if defined(CONFIG_BT_CLASSIC)
