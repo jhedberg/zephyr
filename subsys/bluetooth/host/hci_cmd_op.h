@@ -303,6 +303,21 @@ bool bt_hci_cmd_op_is_pending(struct bt_hci_cmd_op *op);
  */
 int bt_hci_cmd_op_cancel(struct bt_hci_cmd_op *op);
 
+/** @brief Description that an operation was last sent with.
+ *
+ *  For the completion callback of an operation that is sent with different
+ *  descriptions: it tells which command has completed. Valid until the
+ *  operation is sent again.
+ *
+ *  @param op Operation.
+ *
+ *  @return The description.
+ */
+static inline const struct bt_hci_cmd_desc *bt_hci_cmd_op_desc(const struct bt_hci_cmd_op *op)
+{
+	return op->desc;
+}
+
 /** @brief Controller status of the last completion of an operation.
  *
  *  Valid once a completion with a result of 0 or more, or with an error of

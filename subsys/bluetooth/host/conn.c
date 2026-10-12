@@ -135,8 +135,7 @@ static struct bt_conn_tx conn_tx[CONFIG_BT_BUF_ACL_TX_COUNT];
 static struct bt_conn sco_conns[CONFIG_BT_MAX_SCO_CONN];
 #endif /* CONFIG_BT_CLASSIC */
 
-/* The HCI Disconnect operation of a connection, conn->disconnect_op, and its
- * reference.
+/* The HCI command operation of a connection, conn->cmd_op, and its reference.
  *
  * The completion of the operation gets to the connection through the
  * operation, which is a member of it, so a pending operation owns a reference
@@ -162,7 +161,7 @@ static int conn_hci_send(struct bt_conn *conn, const struct bt_hci_cmd_desc *des
 
 	__ASSERT_NO_MSG(ref != NULL);
 
-	err = bt_hci_cmd_send_cb(&conn->disconnect_op, desc);
+	err = bt_hci_cmd_send_cb(&conn->cmd_op, desc);
 	if (err != 0) {
 		/* Not pending, so nothing owns the reference */
 		bt_conn_unref(ref);
@@ -174,13 +173,20 @@ static int conn_hci_send(struct bt_conn *conn, const struct bt_hci_cmd_desc *des
 /* Take back the command of the connection if it has not been sent yet. Its
  * completion function is not called then, and the reference of the operation
  * is released here. The connection is borrowed from the caller, so that is
- * not the last one. A command that has been sent completes on its own.
+ * not the last one.
+ *
+ * Returns true if a command was taken back. One that has been sent completes
+ * on its own.
  */
-static void conn_hci_cancel(struct bt_conn *conn)
+static bool conn_hci_cancel(struct bt_conn *conn)
 {
-	if (bt_hci_cmd_op_cancel(&conn->disconnect_op) == 0) {
-		bt_conn_unref(conn);
+	if (bt_hci_cmd_op_cancel(&conn->cmd_op) != 0) {
+		return false;
 	}
+
+	bt_conn_unref(conn);
+
+	return true;
 }
 
 /* The connection of an operation that has completed, for the completion
@@ -189,7 +195,29 @@ static void conn_hci_cancel(struct bt_conn *conn)
  */
 static struct bt_conn *conn_hci_take(struct bt_hci_cmd_op *op)
 {
-	return CONTAINER_OF(op, struct bt_conn, disconnect_op);
+	return CONTAINER_OF(op, struct bt_conn, cmd_op);
+}
+
+/* Forget the commands of the connection that wait for their turn, see
+ * conn_cmd_request().
+ */
+static void conn_cmds_clear(struct bt_conn *conn)
+{
+	for (int flag = BT_CONN_CMD_FIRST; flag < BT_CONN_CMD_BUSY; flag++) {
+		atomic_clear_bit(conn->flags, flag);
+	}
+}
+
+/* The connection is gone: what it still had to send has nothing left to do.
+ * A command that is with the controller completes on its own.
+ */
+static void conn_cmds_cancel(struct bt_conn *conn)
+{
+	conn_cmds_clear(conn);
+
+	if (conn_hci_cancel(conn)) {
+		atomic_clear_bit(conn->flags, BT_CONN_CMD_BUSY);
+	}
 }
 #endif /* CONFIG_BT_CONN */
 
@@ -1419,10 +1447,7 @@ void bt_conn_set_state(struct bt_conn *conn, bt_conn_state_t state)
 		 */
 		atomic_clear_bit(conn->flags, BT_CONN_TX_FAILED);
 #if defined(CONFIG_BT_CONN)
-		/* A disconnect request that has not been sent yet has nothing
-		 * left to do.
-		 */
-		conn_hci_cancel(conn);
+		conn_cmds_cancel(conn);
 
 		if (bt_conn_is_sco(conn)) {
 			if (IS_ENABLED(CONFIG_BT_CLASSIC)) {
@@ -1942,6 +1967,275 @@ int bt_conn_disconnect(struct bt_conn *conn, uint8_t reason)
 #define AUTO_PHY_CENTRAL_SUPPORTED(_feat) (false)
 #endif
 
+/* Change the state only if it still is what the caller found. Disconnection
+ * Complete is handled in the priority receive path, which can run between a
+ * check and a write of the state, or on another CPU, and takes the connection
+ * to BT_CONN_DISCONNECT_COMPLETE. bt_conn_set_state() writes the state with
+ * the same lock held.
+ */
+static bool conn_state_swap(struct bt_conn *conn, bt_conn_state_t from, bt_conn_state_t to)
+{
+	unsigned int key;
+	bool swapped;
+
+	key = irq_lock();
+
+	swapped = (conn->state == from);
+	if (swapped) {
+		conn->state = to;
+	}
+
+	irq_unlock(key);
+
+	if (swapped) {
+		LOG_DBG("%s -> %s", state2str(from), state2str(to));
+	}
+
+	return swapped;
+}
+
+/* One of the HCI commands that a connection sends through its command
+ * operation, BT_CONN_CMD_*. Its functions get the connection where those of a
+ * command description get the operation.
+ */
+struct conn_cmd {
+	struct bt_hci_cmd_desc desc;
+	/* Adds the parameters, or refuses a command that is no longer wanted
+	 * with a negative value, under the conditions of bt_hci_cmd_encode_t.
+	 */
+	int (*encode)(struct bt_conn *conn, struct net_buf *buf);
+	/* Is told the result on the Bluetooth workqueue. Without it a failure
+	 * is logged.
+	 */
+	void (*done)(struct bt_conn *conn, int result);
+};
+
+/* The two functions of every description in conn_cmds[]. They need the table
+ * themselves, hence the declarations.
+ */
+static int conn_cmd_encode(struct net_buf *buf, struct bt_hci_cmd_op *op);
+static void conn_cmd_done(struct bt_hci_cmd_op *op, int result);
+
+#define CONN_CMD(_opcode, _encode, _done)                                                          \
+	{                                                                                          \
+		.desc = {                                                                          \
+			.opcode = (_opcode),                                                       \
+			.encode = conn_cmd_encode,                                                 \
+			.done = conn_cmd_done,                                                     \
+		},                                                                                 \
+		.encode = (_encode),                                                               \
+		.done = (_done),                                                                   \
+	}
+
+static int disconnect_encode(struct bt_conn *conn, struct net_buf *buf)
+{
+	struct bt_hci_cp_disconnect *cp;
+
+	/* The connection may have gone away, or back to connected, since the
+	 * request was made.
+	 */
+	if (conn->state != BT_CONN_DISCONNECTING) {
+		return -ENOTCONN;
+	}
+
+	cp = net_buf_add(buf, sizeof(*cp));
+	cp->handle = sys_cpu_to_le16(conn->handle);
+	cp->reason = conn->disconnect_reason;
+
+	return 0;
+}
+
+/* The outcome of the HCI Disconnect command. A success needs nothing: the
+ * Disconnection Complete event follows.
+ */
+static void disconnect_done(struct bt_conn *conn, int result)
+{
+	if (result == BT_HCI_ERR_UNKNOWN_CONN_ID) {
+		/* The controller has lost the connection without a word, as
+		 * the event would have taken it out of this state. There is no
+		 * reason to report other than what was found.
+		 */
+		if (conn->state == BT_CONN_DISCONNECTING) {
+			LOG_WRN("conn %p is unknown to the controller", conn);
+			bt_hci_conn_lost(conn, BT_HCI_ERR_UNKNOWN_CONN_ID);
+		}
+	} else if (result > 0 || result == -EIO || result == -ENOBUFS) {
+		/* Rejected by the controller, or never sent to it: the link
+		 * is still up, unless a disconnection has overtaken the
+		 * request. Only the state is put back, as entering
+		 * BT_CONN_CONNECTED sets the connection up anew, and nobody
+		 * is told, as nothing has changed for them.
+		 */
+		if (conn_state_swap(conn, BT_CONN_DISCONNECTING, BT_CONN_CONNECTED)) {
+			LOG_WRN("Unable to disconnect %p (%d)", conn, result);
+
+			/* Let it go on sending, also when it was a failure to
+			 * send that it was to be disconnected for. The TX
+			 * processor has taken it off its list while it was
+			 * not connected.
+			 */
+			atomic_clear_bit(conn->flags, BT_CONN_TX_FAILED);
+			bt_conn_data_ready(conn);
+		}
+	} else {
+		/* Accepted, or the Host is going down or has given up on the
+		 * controller, either of which takes care of the connection.
+		 */
+	}
+}
+
+static const struct conn_cmd conn_cmds[] = {
+	[BT_CONN_CMD_DISCONNECT - BT_CONN_CMD_FIRST] =
+		CONN_CMD(BT_HCI_OP_DISCONNECT, disconnect_encode, disconnect_done),
+};
+
+BUILD_ASSERT(ARRAY_SIZE(conn_cmds) == BT_CONN_CMD_BUSY - BT_CONN_CMD_FIRST,
+	     "Every BT_CONN_CMD_* flag of a command needs its entry");
+
+static const struct conn_cmd *conn_cmd_of(const struct bt_hci_cmd_op *op)
+{
+	return CONTAINER_OF(bt_hci_cmd_op_desc(op), struct conn_cmd, desc);
+}
+
+static int conn_cmd_encode(struct net_buf *buf, struct bt_hci_cmd_op *op)
+{
+	/* The operation is pending, and its reference keeps the connection */
+	struct bt_conn *conn = CONTAINER_OF(op, struct bt_conn, cmd_op);
+	const struct conn_cmd *cmd = conn_cmd_of(op);
+
+	/* The command takes its parameters now: what is asked for from here
+	 * on is another command.
+	 */
+	atomic_clear_bit(conn->flags, BT_CONN_CMD_FIRST + (int)(cmd - conn_cmds));
+
+	return cmd->encode(conn, buf);
+}
+
+/* A disconnect request has taken the connection to BT_CONN_DISCONNECTING.
+ * Every other command is for a connection that is up, and waits while it is
+ * not: a disconnect that the controller rejects leaves it up.
+ */
+static bool conn_cmd_eligible(const struct bt_conn *conn, int flag)
+{
+	return conn->state ==
+	       ((flag == BT_CONN_CMD_DISCONNECT) ? BT_CONN_DISCONNECTING : BT_CONN_CONNECTED);
+}
+
+/* The first of the requested commands that the connection can send now */
+static int conn_cmd_next(const struct bt_conn *conn)
+{
+	for (int flag = BT_CONN_CMD_FIRST; flag < BT_CONN_CMD_BUSY; flag++) {
+		if (atomic_test_bit(conn->flags, flag) && conn_cmd_eligible(conn, flag)) {
+			return flag;
+		}
+	}
+
+	return -ENOENT;
+}
+
+/* Send the next of the commands that the connection has been asked for,
+ * unless one is on its way, the completion of which gets here again. The
+ * connection is borrowed from the caller.
+ */
+static int conn_cmd_send_next(struct bt_conn *conn)
+{
+	int err = 0;
+
+	do {
+		int flag;
+
+		if (atomic_test_and_set_bit(conn->flags, BT_CONN_CMD_BUSY)) {
+			return 0;
+		}
+
+		flag = conn_cmd_next(conn);
+		if (flag >= 0) {
+			err = conn_hci_send(conn, &conn_cmds[flag - BT_CONN_CMD_FIRST].desc);
+			if (err == 0) {
+				return 0;
+			}
+		}
+
+		atomic_clear_bit(conn->flags, BT_CONN_CMD_BUSY);
+
+		/* A request that found the flag set in the meantime has left
+		 * its command to this call.
+		 */
+	} while (err == 0 && conn_cmd_next(conn) >= 0);
+
+	return err;
+}
+
+static void conn_cmd_done(struct bt_hci_cmd_op *op, int result)
+{
+	const struct conn_cmd *cmd = conn_cmd_of(op);
+	/* With the reference of the operation, which is released below */
+	struct bt_conn *conn = conn_hci_take(op);
+
+	/* A controller that has stopped responding is met as by a synchronous
+	 * sender. A stale request and a status of the controller are looked at
+	 * as they are.
+	 */
+	if (result < 0 && result != -ECANCELED) {
+		result = bt_hci_cmd_op_result(op, result);
+	}
+
+	if (cmd->done != NULL) {
+		cmd->done(conn, result);
+	} else if (result > 0) {
+		LOG_WRN("opcode 0x%04x failed for %p (%d)", cmd->desc.opcode, conn, result);
+	} else {
+		/* Sent, no longer wanted, or failed and logged */
+	}
+
+	/* The operation is free for the next command of the connection,
+	 * which gets a reference of its own.
+	 */
+	atomic_clear_bit(conn->flags, BT_CONN_CMD_BUSY);
+	if (conn_cmd_send_next(conn) != 0) {
+		/* Nothing is sent any more, see conn_cmd_request() */
+		conn_cmds_clear(conn);
+	}
+
+	/* May be the last reference */
+	bt_conn_unref(conn);
+}
+
+/* Have the connection send one of its commands, BT_CONN_CMD_*. It is sent
+ * when the commands that the connection was asked for before, and those that
+ * come before it in the order of the flags, have got their responses. Its
+ * parameters are taken from the connection when it is sent, so a command that
+ * is requested again before that is sent once. Neither blocks nor allocates.
+ *
+ * Returns 0 once the command has been sent or waits for its turn, -ENOTCONN
+ * if the connection is not in the state for it, and -EHOSTDOWN if the HCI
+ * transport is closed, in which case nothing is sent.
+ *
+ * A command that still waits for its turn when the HCI transport is closed,
+ * or when the controller is given up on, is dropped without its done function
+ * being called: bt_disable() is what follows, and the connection goes with it.
+ */
+static int conn_cmd_request(struct bt_conn *conn, int flag)
+{
+	int err;
+
+	__ASSERT(conn_cmds[flag - BT_CONN_CMD_FIRST].encode != NULL,
+		 "Command %d of a connection is not part of this build", flag);
+
+	if (!conn_cmd_eligible(conn, flag)) {
+		return -ENOTCONN;
+	}
+
+	atomic_set_bit(conn->flags, flag);
+
+	err = conn_cmd_send_next(conn);
+	if (err != 0) {
+		atomic_clear_bit(conn->flags, flag);
+	}
+
+	return err;
+}
+
 static int do_phy_update(struct bt_conn *conn)
 {
 	uint8_t phy, pref;
@@ -2157,112 +2451,6 @@ static bool disconnect_reason_valid(uint8_t reason)
 	}
 }
 
-/* Change the state only if it still is what the caller found. Disconnection
- * Complete is handled in the priority receive path, which can run between a
- * check and a write of the state, or on another CPU, and takes the connection
- * to BT_CONN_DISCONNECT_COMPLETE. bt_conn_set_state() writes the state with
- * the same lock held.
- */
-static bool conn_state_swap(struct bt_conn *conn, bt_conn_state_t from, bt_conn_state_t to)
-{
-	unsigned int key;
-	bool swapped;
-
-	key = irq_lock();
-
-	swapped = (conn->state == from);
-	if (swapped) {
-		conn->state = to;
-	}
-
-	irq_unlock(key);
-
-	if (swapped) {
-		LOG_DBG("%s -> %s", state2str(from), state2str(to));
-	}
-
-	return swapped;
-}
-
-static int disconnect_encode(struct net_buf *buf, struct bt_hci_cmd_op *op)
-{
-	/* The operation is pending, and its reference keeps the connection */
-	struct bt_conn *conn = CONTAINER_OF(op, struct bt_conn, disconnect_op);
-	struct bt_hci_cp_disconnect *cp;
-
-	/* The connection may have gone away, or back to connected, since the
-	 * request was queued.
-	 */
-	if (conn->state != BT_CONN_DISCONNECTING) {
-		return -ENOTCONN;
-	}
-
-	cp = net_buf_add(buf, sizeof(*cp));
-	cp->handle = sys_cpu_to_le16(conn->handle);
-	cp->reason = conn->disconnect_reason;
-
-	return 0;
-}
-
-/* The outcome of the HCI Disconnect command. A success needs nothing: the
- * Disconnection Complete event follows.
- */
-static void disconnect_done(struct bt_hci_cmd_op *op, int result)
-{
-	/* With the reference of the operation, which is released below */
-	struct bt_conn *conn = conn_hci_take(op);
-
-	/* A controller that has stopped responding is met as by a synchronous
-	 * Disconnect. A stale request and a status of the controller are
-	 * looked at as they are.
-	 */
-	if (result < 0 && result != -ECANCELED) {
-		result = bt_hci_cmd_op_result(op, result);
-	}
-
-	if (result == BT_HCI_ERR_UNKNOWN_CONN_ID) {
-		/* The controller has lost the connection without a word, as
-		 * the event would have taken it out of this state. There is no
-		 * reason to report other than what was found.
-		 */
-		if (conn->state == BT_CONN_DISCONNECTING) {
-			LOG_WRN("conn %p is unknown to the controller", conn);
-			bt_hci_conn_lost(conn, BT_HCI_ERR_UNKNOWN_CONN_ID);
-		}
-	} else if (result > 0 || result == -EIO || result == -ENOBUFS) {
-		/* Rejected by the controller, or never sent to it: the link
-		 * is still up, unless a disconnection has overtaken the
-		 * request. Only the state is put back, as entering
-		 * BT_CONN_CONNECTED sets the connection up anew, and nobody
-		 * is told, as nothing has changed for them.
-		 */
-		if (conn_state_swap(conn, BT_CONN_DISCONNECTING, BT_CONN_CONNECTED)) {
-			LOG_WRN("Unable to disconnect %p (%d)", conn, result);
-
-			/* Let it go on sending, also when it was a failure to
-			 * send that it was to be disconnected for. The TX
-			 * processor has taken it off its list while it was
-			 * not connected.
-			 */
-			atomic_clear_bit(conn->flags, BT_CONN_TX_FAILED);
-			bt_conn_data_ready(conn);
-		}
-	} else {
-		/* Accepted, or the Host is going down or has given up on the
-		 * controller, either of which takes care of the connection.
-		 */
-	}
-
-	/* May be the last reference */
-	bt_conn_unref(conn);
-}
-
-static const struct bt_hci_cmd_desc disconnect_cmd = {
-	.opcode = BT_HCI_OP_DISCONNECT,
-	.encode = disconnect_encode,
-	.done = disconnect_done,
-};
-
 static int conn_disconnect(struct bt_conn *conn, uint8_t reason)
 {
 	int err;
@@ -2285,7 +2473,7 @@ static int conn_disconnect(struct bt_conn *conn, uint8_t reason)
 	}
 
 	/* Everything that the completion relies on is in place before the
-	 * request is queued, as it may complete at once: the state and the
+	 * command is requested, as it may complete at once: the state and the
 	 * reason. The state is only changed if the connection is still
 	 * connected: a disconnection may have overtaken the caller, which
 	 * found it connected.
@@ -2296,21 +2484,12 @@ static int conn_disconnect(struct bt_conn *conn, uint8_t reason)
 
 	conn->disconnect_reason = reason;
 
-	err = conn_hci_send(conn, &disconnect_cmd);
-	if (err == 0) {
-		return 0;
-	}
-
-	if (err == -EBUSY) {
-		/* Requested already */
-		return 0;
-	}
-
-	/* Nothing was queued. If the connection is not as it was either, a
-	 * disconnection has got in between, which is what the caller is
-	 * told.
-	 */
-	if (!conn_state_swap(conn, BT_CONN_DISCONNECTING, BT_CONN_CONNECTED)) {
+	err = conn_cmd_request(conn, BT_CONN_CMD_DISCONNECT);
+	if (err != 0 && !conn_state_swap(conn, BT_CONN_DISCONNECTING, BT_CONN_CONNECTED)) {
+		/* Nothing is sent, and the connection is not as it was
+		 * either: a disconnection has got in between, which is what
+		 * the caller is told.
+		 */
 		err = -ENOTCONN;
 	}
 
