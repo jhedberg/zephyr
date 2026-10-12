@@ -27,6 +27,9 @@
 
 #include "hci_cmd_op.h"
 
+/* The first of the BT_CONN_CMD_* flags that stand for a command */
+#define BT_CONN_CMD_FIRST BT_CONN_CMD_DISCONNECT
+
 typedef enum __packed {
 	BT_CONN_DISCONNECTED,         /* Disconnected, conn is completely down */
 	BT_CONN_DISCONNECT_COMPLETE,  /* Received disconn comp event, transition to DISCONNECTED */
@@ -100,6 +103,14 @@ enum {
 	BT_CONN_CTE_TX_PARAMS_SET,            /* CTE transmission parameters are set */
 	BT_CONN_CTE_REQ_ENABLED,              /* CTE request procedure is enabled */
 	BT_CONN_CTE_RSP_ENABLED,              /* CTE response procedure is enabled */
+
+	/* The HCI commands that the connection sends through its one command
+	 * operation. A flag is set from when its command is asked for until
+	 * the command takes its parameters, and when several are set, their
+	 * commands are sent in the order that they have here.
+	 */
+	BT_CONN_CMD_DISCONNECT,               /* HCI Disconnect */
+	BT_CONN_CMD_BUSY,                     /* One of the commands is on its way */
 
 	/* Total number of flags - must be at the end of the enum */
 	BT_CONN_NUM_FLAGS,
@@ -251,7 +262,7 @@ struct bt_conn {
 	/* Connection error or reason for disconnect */
 	uint8_t			err;
 
-	/* Reason that disconnect_op gives the controller */
+	/* Reason that the HCI Disconnect command gives the controller */
 	uint8_t			disconnect_reason;
 
 	bt_conn_state_t state;
@@ -293,11 +304,11 @@ struct bt_conn {
 	 */
 	struct k_work_delayable	deferred_work;
 
-	/* The operation that sends the HCI Disconnect command of this
-	 * connection. While the operation is pending it owns a reference to the
-	 * connection, see conn_hci_send().
+	/* The operation that sends the HCI commands of this connection, one of
+	 * BT_CONN_CMD_* at a time. While the operation is pending it owns a
+	 * reference to the connection, see conn_hci_send().
 	 */
-	struct bt_hci_cmd_op	disconnect_op;
+	struct bt_hci_cmd_op	cmd_op;
 
 	union {
 		struct bt_conn_le	le;
