@@ -2072,9 +2072,61 @@ static void disconnect_done(struct bt_conn *conn, int result)
 	}
 }
 
+/* Add the parameters of an HCI LE Connection Update command */
+static int conn_update_add(struct bt_conn *conn, struct net_buf *buf,
+			   const struct bt_le_conn_param *param)
+{
+	struct hci_cp_le_conn_update *cp;
+
+	if (conn->state != BT_CONN_CONNECTED) {
+		return -ENOTCONN;
+	}
+
+	cp = net_buf_add(buf, sizeof(*cp));
+	(void)memset(cp, 0, sizeof(*cp));
+	cp->handle = sys_cpu_to_le16(conn->handle);
+	cp->conn_interval_min = sys_cpu_to_le16(param->interval_min);
+	cp->conn_interval_max = sys_cpu_to_le16(param->interval_max);
+	cp->conn_latency = sys_cpu_to_le16(param->latency);
+	cp->supervision_timeout = sys_cpu_to_le16(param->timeout);
+
+	return 0;
+}
+
+/* An update that the Host starts on its own takes the parameters that the
+ * connection keeps, see bt_conn_le_conn_update_nowait().
+ */
+static int conn_update_encode(struct bt_conn *conn, struct net_buf *buf)
+{
+	const struct bt_le_conn_param param = {
+		.interval_min = conn->le.interval_min,
+		.interval_max = conn->le.interval_max,
+		.latency = conn->le.pending_latency,
+		.timeout = conn->le.pending_timeout,
+	};
+
+	return conn_update_add(conn, buf, &param);
+}
+
+/* The outcome of such an update. A success needs nothing: the LE Connection
+ * Update Complete event follows.
+ */
+static void conn_update_done(struct bt_conn *conn, int result)
+{
+	if (result == 0 || result == -ECANCELED) {
+		return;
+	}
+
+	/* No update is under way, and nobody waits for one */
+	LOG_WRN("Unable to update the parameters of %p (%d)", conn, result);
+	atomic_clear_bit(conn->flags, BT_CONN_PERIPHERAL_PARAM_AUTO_UPDATE);
+}
+
 static const struct conn_cmd conn_cmds[] = {
 	[BT_CONN_CMD_DISCONNECT - BT_CONN_CMD_FIRST] =
 		CONN_CMD(BT_HCI_OP_DISCONNECT, disconnect_encode, disconnect_done),
+	[BT_CONN_CMD_CONN_UPDATE - BT_CONN_CMD_FIRST] =
+		CONN_CMD(BT_HCI_OP_LE_CONN_UPDATE, conn_update_encode, conn_update_done),
 };
 
 BUILD_ASSERT(ARRAY_SIZE(conn_cmds) == BT_CONN_CMD_BUSY - BT_CONN_CMD_FIRST,
@@ -2222,6 +2274,17 @@ static int conn_cmd_request(struct bt_conn *conn, int flag)
 	}
 
 	return err;
+}
+
+/* Wait for a command that was sent for a connection from the stack of the
+ * caller, and return what a synchronous command returns.
+ */
+static int conn_req_wait(struct bt_hci_cmd_op_fut *req)
+{
+	int err = bt_hci_cmd_op_wait(&req->op);
+
+	/* An encoder only refuses its command for a connection that is gone */
+	return (err == -ECANCELED) ? -ENOTCONN : err;
 }
 
 static int do_phy_update(struct bt_conn *conn)
@@ -2712,8 +2775,25 @@ bool bt_conn_le_param_req(struct bt_conn *conn, struct bt_le_conn_param *param)
 	return true;
 }
 
-static int send_conn_le_param_update(struct bt_conn *conn,
-				const struct bt_le_conn_param *param)
+/* Keep the parameters of an update: for the fallback to L2CAP, and for the
+ * command of an update that the Host starts on its own, which takes them
+ * with the host lock held when it is sent.
+ */
+static void conn_update_params_store(struct bt_conn *conn, const struct bt_le_conn_param *param)
+{
+	bt_dev_lock();
+	conn->le.interval_min = param->interval_min;
+	conn->le.interval_max = param->interval_max;
+	conn->le.pending_latency = param->latency;
+	conn->le.pending_timeout = param->timeout;
+	bt_dev_unlock();
+}
+
+/* A caller that passes the response of the controller on waits for it. The
+ * Host does not when it starts an update on its own.
+ */
+static int send_conn_le_param_update(struct bt_conn *conn, const struct bt_le_conn_param *param,
+				     bool wait)
 {
 	LOG_DBG("conn %p features 0x%02x params (%d-%d %d %d)", conn, conn->le.features[0],
 		param->interval_min, param->interval_max, param->latency, param->timeout);
@@ -2732,14 +2812,15 @@ static int send_conn_le_param_update(struct bt_conn *conn,
 	     (conn->role == BT_HCI_ROLE_CENTRAL)) {
 		int rc;
 
+		if (!wait) {
+			return bt_conn_le_conn_update_nowait(conn, param);
+		}
+
 		rc = bt_conn_le_conn_update(conn, param);
 
 		/* store those in case of fallback to L2CAP */
 		if (rc == 0) {
-			conn->le.interval_min = param->interval_min;
-			conn->le.interval_max = param->interval_max;
-			conn->le.pending_latency = param->latency;
-			conn->le.pending_timeout = param->timeout;
+			conn_update_params_store(conn, param);
 		}
 
 		return rc;
@@ -2886,7 +2967,7 @@ static void deferred_work(struct k_work *work)
 					 conn->le.pending_latency,
 					 conn->le.pending_timeout);
 
-		err = send_conn_le_param_update(conn, param);
+		err = send_conn_le_param_update(conn, param, false);
 		if (!err) {
 			atomic_clear_bit(conn->flags,
 					 BT_CONN_PERIPHERAL_PARAM_AUTO_UPDATE);
@@ -2903,7 +2984,7 @@ static void deferred_work(struct k_work *work)
 				CONFIG_BT_PERIPHERAL_PREF_LATENCY,
 				CONFIG_BT_PERIPHERAL_PREF_TIMEOUT);
 
-		err = send_conn_le_param_update(conn, param);
+		err = send_conn_le_param_update(conn, param, false);
 		if (!err) {
 			atomic_set_bit(conn->flags,
 				       BT_CONN_PERIPHERAL_PARAM_AUTO_UPDATE);
@@ -4412,20 +4493,17 @@ int bt_conn_le_param_update(struct bt_conn *conn,
 
 	if (IS_ENABLED(CONFIG_BT_CENTRAL) &&
 	    conn->role == BT_CONN_ROLE_CENTRAL) {
-		return send_conn_le_param_update(conn, param);
+		return send_conn_le_param_update(conn, param, true);
 	}
 
 	if (IS_ENABLED(CONFIG_BT_PERIPHERAL)) {
 		/* if peripheral conn param update timer expired just send request */
 		if (atomic_test_bit(conn->flags, BT_CONN_PERIPHERAL_PARAM_UPDATE)) {
-			return send_conn_le_param_update(conn, param);
+			return send_conn_le_param_update(conn, param, true);
 		}
 
 		/* store new conn params to be used by update timer */
-		conn->le.interval_min = param->interval_min;
-		conn->le.interval_max = param->interval_max;
-		conn->le.pending_latency = param->latency;
-		conn->le.pending_timeout = param->timeout;
+		conn_update_params_store(conn, param);
 		atomic_set_bit(conn->flags, BT_CONN_PERIPHERAL_PARAM_SET);
 	}
 
@@ -4845,26 +4923,51 @@ int bt_conn_le_create_synced(const struct bt_le_ext_adv *adv,
 }
 #endif /* CONFIG_BT_CENTRAL */
 
+/* An HCI LE Connection Update command that its sender waits for. All that it
+ * takes is on the stack of the sender, and the connection is borrowed from
+ * the sender too: the command needs no reference of its own, as the sender
+ * does not return before the command has completed.
+ */
+struct conn_update_req {
+	struct bt_hci_cmd_op_fut cmd;
+	struct bt_conn *conn;
+	const struct bt_le_conn_param *param;
+};
+
+static int conn_update_req_encode(struct net_buf *buf, struct bt_hci_cmd_op *op)
+{
+	struct conn_update_req *req = CONTAINER_OF(op, struct conn_update_req, cmd.op);
+
+	return conn_update_add(req->conn, buf, req->param);
+}
+
+static const struct bt_hci_cmd_desc conn_update_req_cmd = {
+	.opcode = BT_HCI_OP_LE_CONN_UPDATE,
+	.encode = conn_update_req_encode,
+};
+
 int bt_conn_le_conn_update(struct bt_conn *conn,
 			   const struct bt_le_conn_param *param)
 {
-	struct hci_cp_le_conn_update *conn_update;
-	struct net_buf *buf;
+	struct conn_update_req req = {
+		.conn = conn,
+		.param = param,
+	};
+	int err;
 
-	buf = bt_hci_cmd_alloc(K_FOREVER);
-	if (!buf) {
-		return -ENOBUFS;
+	err = bt_hci_cmd_send_async(&req.cmd, &conn_update_req_cmd);
+	if (err != 0) {
+		return err;
 	}
 
-	conn_update = net_buf_add(buf, sizeof(*conn_update));
-	(void)memset(conn_update, 0, sizeof(*conn_update));
-	conn_update->handle = sys_cpu_to_le16(conn->handle);
-	conn_update->conn_interval_min = sys_cpu_to_le16(param->interval_min);
-	conn_update->conn_interval_max = sys_cpu_to_le16(param->interval_max);
-	conn_update->conn_latency = sys_cpu_to_le16(param->latency);
-	conn_update->supervision_timeout = sys_cpu_to_le16(param->timeout);
+	return conn_req_wait(&req.cmd);
+}
 
-	return bt_hci_cmd_send_sync(BT_HCI_OP_LE_CONN_UPDATE, buf, NULL);
+int bt_conn_le_conn_update_nowait(struct bt_conn *conn, const struct bt_le_conn_param *param)
+{
+	conn_update_params_store(conn, param);
+
+	return conn_cmd_request(conn, BT_CONN_CMD_CONN_UPDATE);
 }
 
 #if defined(CONFIG_BT_SMP) || defined(CONFIG_BT_CLASSIC)
