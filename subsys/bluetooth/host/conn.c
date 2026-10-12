@@ -2086,6 +2086,47 @@ static int conn_handle_encode(struct bt_conn *conn, struct net_buf *buf)
 	return 0;
 }
 
+/* LE Start Encryption is a command of a central with SMP. Its functions call
+ * into SMP, and nothing refers to them in another build.
+ */
+#define CONN_CMD_ENCRYPT_ENABLED (IS_ENABLED(CONFIG_BT_SMP) && IS_ENABLED(CONFIG_BT_CENTRAL))
+
+static int encrypt_encode(struct bt_conn *conn, struct net_buf *buf)
+{
+	struct bt_hci_cp_le_start_encryption *cp;
+
+	if (conn->state != BT_CONN_CONNECTED) {
+		return -ENOTCONN;
+	}
+
+	cp = net_buf_add(buf, sizeof(*cp));
+	(void)memset(cp, 0, sizeof(*cp));
+	cp->handle = sys_cpu_to_le16(conn->handle);
+
+	/* SMP has put the key aside */
+	return bt_smp_enc_params(conn, cp);
+}
+
+/* The outcome of an HCI LE Start Encryption command that nobody waits for.
+ * A success needs nothing: the Encryption Change event follows. A refusal of
+ * the encoder means that encryption is no longer wanted, and a closed HCI
+ * transport or a controller that is given up on ends more than this command,
+ * see conn_cmd_request().
+ */
+static void encrypt_done(struct bt_conn *conn, int result)
+{
+	if (result == 0 || result == -ECANCELED || result == -EHOSTDOWN || result == -ETIMEDOUT) {
+		return;
+	}
+
+	LOG_ERR("Failed to start encryption of %p (%d)", conn, result);
+
+	/* No event follows: SMP is told, as by the return value of a
+	 * synchronous command.
+	 */
+	bt_smp_enc_failed(conn);
+}
+
 static int auto_phy_encode(struct bt_conn *conn, struct net_buf *buf)
 {
 	uint8_t pref = (conn->role == BT_HCI_ROLE_CENTRAL) ? AUTO_PHY_CENTRAL_PREF
@@ -2183,6 +2224,10 @@ static void conn_update_done(struct bt_conn *conn, int result)
 static const struct conn_cmd conn_cmds[] = {
 	[BT_CONN_CMD_DISCONNECT - BT_CONN_CMD_FIRST] =
 		CONN_CMD(BT_HCI_OP_DISCONNECT, disconnect_encode, disconnect_done),
+	[BT_CONN_CMD_ENCRYPT - BT_CONN_CMD_FIRST] =
+		CONN_CMD(BT_HCI_OP_LE_START_ENCRYPTION,
+			 CONN_CMD_ENCRYPT_ENABLED ? encrypt_encode : NULL,
+			 CONN_CMD_ENCRYPT_ENABLED ? encrypt_done : NULL),
 	/* Results in an LE Read Remote Features Complete event */
 	[BT_CONN_CMD_REMOTE_FEATURES - BT_CONN_CMD_FIRST] =
 		CONN_CMD(BT_HCI_OP_LE_READ_REMOTE_FEATURES, conn_handle_encode, NULL),
@@ -2351,7 +2396,9 @@ static int conn_req_wait(struct bt_hci_cmd_op_fut *req)
 {
 	int err = bt_hci_cmd_op_wait(&req->op);
 
-	/* An encoder only refuses its command for a connection that is gone */
+	/* Refused by its encoder: the connection is gone, and what the
+	 * command was for with it.
+	 */
 	return (err == -ECANCELED) ? -ENOTCONN : err;
 }
 
@@ -3208,32 +3255,47 @@ void bt_conn_identity_resolved(struct bt_conn *conn)
 	}
 }
 
-int bt_conn_le_start_encryption(struct bt_conn *conn, uint8_t rand[8],
-				uint8_t ediv[2], const uint8_t *ltk, size_t len)
+/* An HCI LE Start Encryption command that its sender waits for. The
+ * connection is borrowed from the sender, as for struct conn_update_req.
+ */
+struct encrypt_req {
+	struct bt_hci_cmd_op_fut cmd;
+	struct bt_conn *conn;
+};
+
+static int encrypt_req_encode(struct net_buf *buf, struct bt_hci_cmd_op *op)
 {
-	struct bt_hci_cp_le_start_encryption *cp;
-	struct net_buf *buf;
+	struct encrypt_req *req = CONTAINER_OF(op, struct encrypt_req, cmd.op);
 
-	if (len > sizeof(cp->ltk)) {
-		return -EINVAL;
+	return encrypt_encode(req->conn, buf);
+}
+
+static const struct bt_hci_cmd_desc encrypt_req_cmd = {
+	.opcode = BT_HCI_OP_LE_START_ENCRYPTION,
+	.encode = encrypt_req_encode,
+};
+
+int bt_conn_le_start_encryption(struct bt_conn *conn, bool wait)
+{
+	struct encrypt_req req = {
+		.conn = conn,
+	};
+	int err;
+
+	if (!CONN_CMD_ENCRYPT_ENABLED) {
+		return -ENOTSUP;
 	}
 
-	buf = bt_hci_cmd_alloc(K_FOREVER);
-	if (!buf) {
-		return -ENOBUFS;
+	if (!wait) {
+		return conn_cmd_request(conn, BT_CONN_CMD_ENCRYPT);
 	}
 
-	cp = net_buf_add(buf, sizeof(*cp));
-	cp->handle = sys_cpu_to_le16(conn->handle);
-	(void)memcpy(cp->rand, rand, sizeof(cp->rand));
-	(void)memcpy(cp->ediv, ediv, sizeof(cp->ediv));
-
-	memcpy(cp->ltk, ltk, len);
-	if (len < sizeof(cp->ltk)) {
-		(void)memset(cp->ltk + len, 0, sizeof(cp->ltk) - len);
+	err = bt_hci_cmd_send_async(&req.cmd, &encrypt_req_cmd);
+	if (err != 0) {
+		return err;
 	}
 
-	return bt_hci_cmd_send_sync(BT_HCI_OP_LE_START_ENCRYPTION, buf, NULL);
+	return conn_req_wait(&req.cmd);
 }
 #endif /* CONFIG_BT_SMP */
 

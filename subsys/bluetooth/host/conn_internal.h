@@ -109,6 +109,7 @@ enum {
 	 * commands are sent in the order that they have here.
 	 */
 	BT_CONN_CMD_DISCONNECT,               /* HCI Disconnect */
+	BT_CONN_CMD_ENCRYPT,                  /* HCI LE Start Encryption */
 	BT_CONN_CMD_REMOTE_FEATURES,          /* HCI LE Read Remote Features */
 	BT_CONN_CMD_REMOTE_VERSION,           /* HCI Read Remote Version Information */
 	BT_CONN_CMD_AUTO_PHY,                 /* HCI LE Set PHY, to the automatic preference */
@@ -619,9 +620,15 @@ void bt_conn_notify_cs_procedure_enable_available(struct bt_conn *conn, uint8_t 
 /* If role specific LTK is present */
 bool bt_conn_ltk_present(const struct bt_conn *conn);
 
-/* rand and ediv should be in BT order */
-int bt_conn_le_start_encryption(struct bt_conn *conn, uint8_t rand[8],
-				uint8_t ediv[2], const uint8_t *ltk, size_t len);
+/* Have a central start or refresh the encryption of a connection, with the
+ * key that SMP has put aside for the command, see bt_smp_enc_params().
+ *
+ * A caller that waits gets the response of the controller, as from
+ * bt_hci_cmd_send_sync(), or -ENOTCONN if the connection is gone. Otherwise
+ * the call does not block, and SMP is told of a command that fails
+ * afterwards, see bt_smp_enc_failed().
+ */
+int bt_conn_le_start_encryption(struct bt_conn *conn, bool wait);
 
 /* Notify higher layers that RPA was resolved */
 void bt_conn_identity_resolved(struct bt_conn *conn);

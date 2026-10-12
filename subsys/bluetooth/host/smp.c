@@ -183,6 +183,15 @@ struct bt_smp {
 	/* Temporary key */
 	uint8_t				tk[16];
 
+#if defined(CONFIG_BT_CENTRAL)
+	/* What the HCI LE Start Encryption command of a central takes besides
+	 * the key, which is in tk: see bt_smp_enc_params().
+	 */
+	uint8_t				enc_rand[8];
+	uint8_t				enc_ediv[2];
+	uint8_t				enc_size;
+#endif /* CONFIG_BT_CENTRAL */
+
 	/* Remote Public Key for LE SC */
 	uint8_t				pkey[BT_PUB_KEY_LEN];
 
@@ -628,6 +637,99 @@ static uint8_t get_encryption_key_size(struct bt_smp *smp)
 	 */
 	return MIN(req->max_key_size, rsp->max_key_size);
 }
+
+/* The context of a connection, for what the HCI command of a connection
+ * calls: it does not go through the channels of the connection, which change
+ * on other threads.
+ */
+static struct bt_smp *smp_of_conn(const struct bt_conn *conn)
+{
+	ARRAY_FOR_EACH_PTR(bt_smp_pool, smp) {
+		if (smp->chan.chan.conn == conn) {
+			return smp;
+		}
+	}
+
+	return NULL;
+}
+
+#if defined(CONFIG_BT_CENTRAL)
+/* Start the encryption of the connection as its central, with the LTK of a
+ * bond or, without one, with the key that pairing has put in tk. The key is
+ * put aside for the command, which takes it when it is sent, see
+ * bt_smp_enc_params().
+ *
+ * A caller that waits gets the response of the controller. Otherwise the call
+ * does not block, and a command that fails afterwards ends up in
+ * bt_smp_enc_failed().
+ *
+ * The connection is borrowed from the caller. It is not taken from the
+ * context: bt_smp_start_security() is called from other threads than the one
+ * that clears the context when the connection goes away.
+ */
+static int smp_start_encryption(struct bt_smp *smp, struct bt_conn *conn,
+				const struct bt_keys *keys, bool wait)
+{
+	int err;
+
+	/* With the host lock, which the encoder of the command holds */
+	bt_dev_lock();
+
+	if (keys != NULL) {
+		(void)memcpy(smp->enc_rand, keys->ltk.rand, sizeof(smp->enc_rand));
+		(void)memcpy(smp->enc_ediv, keys->ltk.ediv, sizeof(smp->enc_ediv));
+		(void)memcpy(smp->tk, keys->ltk.val, sizeof(smp->tk));
+		smp->enc_size = keys->enc_size;
+	} else {
+		/* Rand and EDiv are 0 for the STK and for an LE SC LTK */
+		(void)memset(smp->enc_rand, 0, sizeof(smp->enc_rand));
+		(void)memset(smp->enc_ediv, 0, sizeof(smp->enc_ediv));
+		smp->enc_size = get_encryption_key_size(smp);
+	}
+
+	atomic_set_bit(smp->flags, SMP_FLAG_ENC_PENDING);
+
+	bt_dev_unlock();
+
+	err = bt_conn_le_start_encryption(conn, wait);
+	if (err != 0) {
+		atomic_clear_bit(smp->flags, SMP_FLAG_ENC_PENDING);
+	}
+
+	return err;
+}
+
+int bt_smp_enc_params(struct bt_conn *conn, struct bt_hci_cp_le_start_encryption *cp)
+{
+	struct bt_smp *smp = smp_of_conn(conn);
+
+	if (smp == NULL) {
+		return -ENOTCONN;
+	}
+
+	/* Given up in the meantime, by a pairing that failed or timed out */
+	if (!atomic_test_bit(smp->flags, SMP_FLAG_ENC_PENDING)) {
+		return -ECANCELED;
+	}
+
+	(void)memcpy(cp->rand, smp->enc_rand, sizeof(cp->rand));
+	(void)memcpy(cp->ediv, smp->enc_ediv, sizeof(cp->ediv));
+	(void)memcpy(cp->ltk, smp->tk, MIN(smp->enc_size, sizeof(cp->ltk)));
+
+	return 0;
+}
+#else
+static int smp_start_encryption(struct bt_smp *smp, struct bt_conn *conn,
+				const struct bt_keys *keys, bool wait)
+{
+	ARG_UNUSED(smp);
+	ARG_UNUSED(conn);
+	ARG_UNUSED(keys);
+	ARG_UNUSED(wait);
+
+	return -ENOTSUP;
+}
+#endif /* CONFIG_BT_CENTRAL */
 
 /* Check that if a new pairing procedure with an existing bond will not lower
  * the established security level of the bond.
@@ -2651,24 +2753,18 @@ static uint8_t legacy_pairing_random(struct bt_smp *smp)
 
 	if (IS_ENABLED(CONFIG_BT_CENTRAL) &&
 	    conn->role == BT_HCI_ROLE_CENTRAL) {
-		uint8_t ediv[2], rand[8];
-
-		/* No need to store central STK */
 		err = smp_s1(smp->tk, smp->rrnd, smp->prnd, tmp);
 		if (err) {
 			return BT_SMP_ERR_UNSPECIFIED;
 		}
 
-		/* Rand and EDiv are 0 for the STK */
-		(void)memset(ediv, 0, sizeof(ediv));
-		(void)memset(rand, 0, sizeof(rand));
-		if (bt_conn_le_start_encryption(conn, rand, ediv, tmp,
-						get_encryption_key_size(smp))) {
+		/* The STK is kept where the command finds it when it is sent */
+		memcpy(smp->tk, tmp, sizeof(smp->tk));
+
+		if (smp_start_encryption(smp, conn, NULL, false) != 0) {
 			LOG_ERR("Failed to start encryption");
 			return BT_SMP_ERR_UNSPECIFIED;
 		}
-
-		atomic_set_bit(smp->flags, SMP_FLAG_ENC_PENDING);
 
 		if (IS_ENABLED(CONFIG_BT_SMP_USB_HCI_CTLR_WORKAROUND)) {
 			if (smp->remote_dist & BT_SMP_DIST_ENC_KEY) {
@@ -2875,8 +2971,11 @@ static int smp_init(struct bt_smp *smp)
 {
 	/* SMP_FLAG_SEC_REQ is claimed before this runs and has to stay set for
 	 * the whole procedure, so the flags are cleared without ever dropping
-	 * it.
+	 * it. The host lock keeps the encoder of a Start Encryption command
+	 * from reading the context while it is cleared, see
+	 * bt_smp_enc_params().
 	 */
+	bt_dev_lock();
 	(void)atomic_and(smp->flags, BIT(SMP_FLAG_SEC_REQ));
 
 	/* Initialize SMP context excluding L2CAP channel context and anything
@@ -2885,6 +2984,7 @@ static int smp_init(struct bt_smp *smp)
 	(void)memset(smp, 0, offsetof(struct bt_smp, flags));
 	(void)memset(&smp->method, 0,
 		     offsetof(struct bt_smp, chan) - offsetof(struct bt_smp, method));
+	bt_dev_unlock();
 
 	/* Generate local random number */
 	if (bt_rand(smp->prnd, 16)) {
@@ -3027,6 +3127,20 @@ static struct bt_smp *smp_chan_get(struct bt_conn *conn)
 	}
 
 	return CONTAINER_OF(chan, struct bt_smp, chan.chan);
+}
+
+void bt_smp_enc_failed(struct bt_conn *conn)
+{
+	struct bt_smp *smp = smp_of_conn(conn);
+
+	/* Nothing to do for encryption that has been given up meanwhile */
+	if (smp == NULL || !atomic_test_and_clear_bit(smp->flags, SMP_FLAG_ENC_PENDING)) {
+		return;
+	}
+
+	LOG_ERR("Failed to start encryption");
+
+	smp_error(smp, BT_SMP_ERR_UNSPECIFIED);
 }
 
 bool bt_smp_request_ltk(struct bt_conn *conn, uint64_t rand, uint16_t ediv, uint8_t *ltk)
@@ -4434,15 +4548,10 @@ static uint8_t smp_security_request(struct bt_smp *smp, struct net_buf *buf)
 		goto pair;
 	}
 
-	if (bt_conn_le_start_encryption(conn, conn->le.keys->ltk.rand,
-					conn->le.keys->ltk.ediv,
-					conn->le.keys->ltk.val,
-					conn->le.keys->enc_size) < 0) {
+	if (smp_start_encryption(smp, conn, conn->le.keys, false) != 0) {
 		LOG_ERR("Failed to start encryption");
 		return BT_SMP_ERR_UNSPECIFIED;
 	}
-
-	atomic_set_bit(smp->flags, SMP_FLAG_ENC_PENDING);
 
 	return 0;
 pair:
@@ -4701,8 +4810,7 @@ static uint8_t smp_dhkey_check(struct bt_smp *smp, struct net_buf *buf)
 
 	if (IS_ENABLED(CONFIG_BT_CENTRAL) &&
 	    smp->chan.chan.conn->role == BT_HCI_ROLE_CENTRAL) {
-		uint8_t e[16], r[16], enc_size;
-		uint8_t ediv[2], rand[8];
+		uint8_t e[16], r[16];
 
 		(void)memset(r, 0, sizeof(r));
 
@@ -4735,18 +4843,11 @@ static uint8_t smp_dhkey_check(struct bt_smp *smp, struct net_buf *buf)
 			return BT_SMP_ERR_DHKEY_CHECK_FAILED;
 		}
 
-		enc_size = get_encryption_key_size(smp);
-
-		/* Rand and EDiv are 0 */
-		(void)memset(ediv, 0, sizeof(ediv));
-		(void)memset(rand, 0, sizeof(rand));
-		if (bt_conn_le_start_encryption(smp->chan.chan.conn, rand, ediv,
-						smp->tk, enc_size) < 0) {
+		/* The LTK is in tk */
+		if (smp_start_encryption(smp, smp->chan.chan.conn, NULL, false) != 0) {
 			LOG_ERR("Failed to start encryption");
 			return BT_SMP_ERR_UNSPECIFIED;
 		}
-
-		atomic_set_bit(smp->flags, SMP_FLAG_ENC_PENDING);
 
 		if (IS_ENABLED(CONFIG_BT_SMP_USB_HCI_CTLR_WORKAROUND)) {
 			if (smp->remote_dist & BT_SMP_DIST_ID_KEY) {
@@ -5025,7 +5126,10 @@ static void bt_smp_disconnected(struct bt_l2cap_chan *chan)
 		}
 	}
 
+	/* With the host lock, see smp_init() */
+	bt_dev_lock();
 	(void)memset(smp, 0, sizeof(*smp));
+	bt_dev_unlock();
 }
 
 static void bt_smp_encrypt_change(struct bt_l2cap_chan *chan,
@@ -6339,18 +6443,15 @@ int bt_smp_start_security(struct bt_conn *conn)
 			return smp_send_pairing_req(conn);
 		}
 
-		/* LE SC LTK and legacy central LTK are stored in same place */
-		err = bt_conn_le_start_encryption(conn,
-						  conn->le.keys->ltk.rand,
-						  conn->le.keys->ltk.ediv,
-						  conn->le.keys->ltk.val,
-						  conn->le.keys->enc_size);
+		/* LE SC LTK and legacy central LTK are stored in same place.
+		 * The response of the controller is the caller's to have.
+		 */
+		err = smp_start_encryption(smp, conn, conn->le.keys, true);
 		if (err) {
 			return err;
 		}
 
 		atomic_set_bit(smp->allowed_cmds, BT_SMP_CMD_SECURITY_REQUEST);
-		atomic_set_bit(smp->flags, SMP_FLAG_ENC_PENDING);
 		return 0;
 	}
 #endif /* CONFIG_BT_CENTRAL && CONFIG_BT_SMP */
