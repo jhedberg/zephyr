@@ -264,6 +264,9 @@ void test_disconnect_complete(uint8_t reason)
 	bt_hci_recv(hci_dev, evt);
 }
 
+/* The command buffer that the controller keeps, see test_cmd_script.keep */
+static struct net_buf *kept_cmd;
+
 static void cmd_handle(struct net_buf *cmd)
 {
 	struct bt_hci_cmd_hdr *chdr;
@@ -284,6 +287,10 @@ static void cmd_handle(struct net_buf *cmd)
 		(void)memset(test_other_params, 0, sizeof(test_other_params));
 		(void)memcpy(test_other_params, cmd->data,
 			     MIN(cmd->len, sizeof(test_other_params)));
+		if (test_other.keep && kept_cmd == NULL) {
+			kept_cmd = net_buf_ref(cmd);
+		}
+
 		scripted(&test_other, &other_rsp_work);
 		return;
 	}
@@ -444,6 +451,7 @@ void test_driver_reset(void)
 	(void)k_work_cancel_delayable(&cmd_rsp_work);
 	(void)k_work_cancel_delayable(&disconnect_rsp_work);
 	(void)k_work_cancel_delayable(&other_rsp_work);
+	net_buf_drop(&kept_cmd);
 
 	test_cmd = respond_at_once;
 	test_disconnect = respond_at_once;
