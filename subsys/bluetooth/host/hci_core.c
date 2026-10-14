@@ -215,10 +215,8 @@ struct cmd_data {
 	/** Used by bt_hci_cmd_send_sync. */
 	struct k_sem *sync;
 
-#if defined(CONFIG_BT_CONN)
 	/** Asynchronous operation that the buffer was encoded for, if any */
 	struct bt_hci_cmd_op *op;
-#endif /* CONFIG_BT_CONN */
 };
 
 static struct cmd_data cmd_data[BT_BUF_CMD_TX_COUNT];
@@ -226,7 +224,6 @@ static struct cmd_data cmd_data[BT_BUF_CMD_TX_COUNT];
 #define cmd(buf) (&cmd_data[net_buf_id(buf)])
 #define acl(buf) ((struct bt_conn_rx *)net_buf_user_data(buf))
 
-#if defined(CONFIG_BT_CONN)
 /* Whether asynchronous commands wait for a command buffer */
 static bool cmd_ops_queued(void)
 {
@@ -238,17 +235,6 @@ static void cmd_op_clear(struct net_buf *buf)
 {
 	cmd(buf)->op = NULL;
 }
-#else
-static bool cmd_ops_queued(void)
-{
-	return false;
-}
-
-static void cmd_op_clear(struct net_buf *buf)
-{
-	ARG_UNUSED(buf);
-}
-#endif /* CONFIG_BT_CONN */
 
 static bool drv_quirk_no_reset(void)
 {
@@ -333,7 +319,6 @@ static void cmd_deadline_start(void)
  * command complete or command status.
  */
 #define CMD_BUF_SIZE MAX(BT_BUF_EVT_RX_SIZE, BT_BUF_CMD_TX_SIZE)
-#if defined(CONFIG_BT_CONN)
 /* A freed command buffer that is kept for the queued asynchronous commands
  * instead of going back to the pool. Protected by cmd_lock.
  */
@@ -394,9 +379,6 @@ static void hci_cmd_pool_destroy(struct net_buf *buf)
 }
 
 #define HCI_CMD_POOL_DESTROY hci_cmd_pool_destroy
-#else
-#define HCI_CMD_POOL_DESTROY NULL
-#endif /* CONFIG_BT_CONN */
 
 NET_BUF_POOL_FIXED_DEFINE(hci_cmd_pool, BT_BUF_CMD_TX_COUNT, CMD_BUF_SIZE, 0, HCI_CMD_POOL_DESTROY);
 
@@ -594,7 +576,6 @@ struct net_buf *bt_hci_cmd_alloc(k_timeout_t timeout)
 	return buf;
 }
 
-#if defined(CONFIG_BT_CONN)
 /* Asynchronous HCI command operations. An operation is caller-owned storage
  * for one command: it is queued without a command buffer, gets its buffer and
  * its parameters from the TX processor, and then takes the path of every
@@ -818,31 +799,6 @@ static int cmd_op_rsp(struct bt_hci_cmd_op *op, uint8_t status, struct net_buf *
 
 	return err;
 }
-#else
-static struct bt_hci_cmd_op *cmd_op_detach(struct net_buf *buf)
-{
-	ARG_UNUSED(buf);
-
-	return NULL;
-}
-
-static void cmd_op_sent(struct net_buf *buf)
-{
-	ARG_UNUSED(buf);
-}
-
-static void cmd_op_complete(struct bt_hci_cmd_op *op, int result)
-{
-	ARGS_UNUSED(op, result);
-}
-
-static int cmd_op_rsp(struct bt_hci_cmd_op *op, uint8_t status, struct net_buf *evt)
-{
-	ARGS_UNUSED(op, evt);
-
-	return status;
-}
-#endif /* CONFIG_BT_CONN */
 
 /* Take the command that is with the controller: buf if it still is that
  * command, whichever it is if buf is NULL. The caller that gets it completes
@@ -983,7 +939,6 @@ static bool cmd_tx_queue_put(struct net_buf *buf)
 	return open;
 }
 
-#if defined(CONFIG_BT_CONN)
 /* Start with no asynchronous command waiting for a buffer */
 static void cmd_ops_init(void)
 {
@@ -1126,38 +1081,6 @@ static void cmd_seq_sent(void)
 {
 	cmd_seq_given_up = false;
 }
-#else
-static void cmd_ops_init(void)
-{
-}
-
-static struct net_buf *cmd_ops_purge_take(sys_slist_t *queue, sys_slist_t *buffered,
-					  sys_slist_t *ops)
-{
-	ARGS_UNUSED(queue, buffered, ops);
-
-	return NULL;
-}
-
-static void cmd_op_buf_free(struct net_buf *kept)
-{
-	ARG_UNUSED(kept);
-}
-
-static void cmd_ops_purge_complete(sys_slist_t *buffered, sys_slist_t *ops, int err)
-{
-	ARGS_UNUSED(buffered, ops, err);
-}
-
-static struct bt_hci_cmd_op *cmd_seq_give_up(void)
-{
-	return NULL;
-}
-
-static void cmd_seq_sent(void)
-{
-}
-#endif /* CONFIG_BT_CONN */
 
 /* Drop every queued command, completing each with err: the HCI transport has
  * been closed, the controller has been given up on, or nothing could be sent
@@ -1368,7 +1291,6 @@ int bt_hci_cmd_send(uint16_t opcode, struct net_buf *buf)
 	return 0;
 }
 
-#if defined(CONFIG_BT_CONN)
 /* Put the command that an operation is at into the buffer, which for a
  * sequence is the first of its remaining steps that has something to send.
  * Called on the TX processor without cmd_lock, as the encoders are code of
@@ -1855,43 +1777,6 @@ int bt_hci_cmd_op_cancel(struct bt_hci_cmd_op *op)
 
 	return 0;
 }
-#else
-static void cmd_rsp_taken(void)
-{
-}
-
-static void cmd_rsp_applied(void)
-{
-}
-
-static void cmd_ops_dispatch(void)
-{
-}
-
-static bool cmd_seq_waiting(void)
-{
-	return false;
-}
-
-static bool cmd_seq_lets(const struct net_buf *buf)
-{
-	ARG_UNUSED(buf);
-
-	return true;
-}
-
-static void cmd_op_applied(const struct bt_hci_cmd_op *op)
-{
-	ARG_UNUSED(op);
-}
-
-static int cmd_op_continue(struct bt_hci_cmd_op *op)
-{
-	ARG_UNUSED(op);
-
-	return 1;
-}
-#endif /* CONFIG_BT_CONN */
 
 static bool process_pending_cmd(k_timeout_t timeout);
 
@@ -2155,7 +2040,6 @@ int bt_hci_cmd_send_sync(uint16_t opcode, struct net_buf *buf,
 	return 0;
 }
 
-#if defined(CONFIG_BT_CONN)
 int bt_hci_cmd_op_result(const struct bt_hci_cmd_op *op, int result)
 {
 	uint16_t opcode = cmd_op_opcode(op);
@@ -2217,7 +2101,6 @@ int bt_hci_cmd_op_wait(struct bt_hci_cmd_op *op)
 	/* The operation is the caller's again */
 	return bt_hci_cmd_op_result(op, fut->result);
 }
-#endif /* CONFIG_BT_CONN */
 
 int bt_hci_le_rand(void *buffer, size_t len)
 {
