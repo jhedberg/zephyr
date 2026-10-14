@@ -23,6 +23,7 @@
 #include <zephyr/drivers/bluetooth.h>
 #include <zephyr/kernel.h>
 #include <zephyr/net_buf.h>
+#include <zephyr/sys/atomic.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/util.h>
 
@@ -43,6 +44,15 @@ struct test_cmd_script test_disconnect;
 struct test_cmd_script test_other;
 uint16_t test_other_opcode;
 uint8_t test_other_params[32];
+uint16_t test_held_opcode;
+uint8_t test_held_status;
+unsigned int test_held_count;
+
+/* Whether the controller holds back its response to test_held_opcode */
+static atomic_t held;
+
+uint8_t test_hci_version;
+bool test_no_public_addr;
 uint16_t test_log[16];
 unsigned int test_log_len;
 uint8_t test_le_features[8];
@@ -267,12 +277,82 @@ void test_disconnect_complete(uint8_t reason)
 /* The command buffer that the controller keeps, see test_cmd_script.keep */
 static struct net_buf *kept_cmd;
 
+/* The response to a command that is not scripted: what the Host needs of the
+ * commands that bt_enable() sends, zeroes otherwise
+ */
+static void respond(uint16_t opcode, uint8_t status)
+{
+	struct net_buf *evt;
+	uint8_t *rp;
+
+	rp = cmd_complete(&evt, opcode, 1U, GENERIC_RP_SIZE);
+	rp[0] = status;
+
+	switch (opcode) {
+	case BT_HCI_OP_READ_LOCAL_FEATURES: {
+		struct bt_hci_rp_read_local_features *features = (void *)rp;
+
+		/* LE supported and BR/EDR not supported */
+		features->features[4] = BIT(5) | BIT(6);
+		break;
+	}
+	case BT_HCI_OP_READ_SUPPORTED_COMMANDS: {
+		struct bt_hci_rp_read_supported_commands *commands = (void *)rp;
+
+		(void)memset(commands->commands, 0xFF, sizeof(commands->commands));
+		break;
+	}
+	case BT_HCI_OP_READ_LOCAL_VERSION_INFO: {
+		struct bt_hci_rp_read_local_version_info *version = (void *)rp;
+
+		version->hci_version = test_hci_version;
+		break;
+	}
+	case BT_HCI_OP_READ_BD_ADDR: {
+		struct bt_hci_rp_read_bd_addr *addr = (void *)rp;
+
+		if (!test_no_public_addr) {
+			(void)memset(&addr->bdaddr, 0x11, sizeof(addr->bdaddr));
+		}
+		break;
+	}
+	case BT_HCI_OP_LE_READ_BUFFER_SIZE: {
+		struct bt_hci_rp_le_read_buffer_size *size = (void *)rp;
+
+		size->le_max_len = sys_cpu_to_le16(LE_ACL_MAX_LEN);
+		size->le_max_num = LE_ACL_MAX_NUM;
+		break;
+	}
+	case BT_HCI_OP_LE_READ_LOCAL_FEATURES: {
+		struct bt_hci_rp_le_read_local_features *features = (void *)rp;
+
+		(void)memcpy(features->features, test_le_features, sizeof(features->features));
+		break;
+	}
+	case BT_HCI_OP_LE_READ_SUPP_STATES: {
+		struct bt_hci_rp_le_read_supp_states *states = (void *)rp;
+
+		(void)memset(states->le_states, 0xFF, sizeof(states->le_states));
+		break;
+	}
+	default:
+		break;
+	}
+
+	bt_hci_recv(hci_dev, evt);
+}
+
+void test_held_respond(void)
+{
+	if (atomic_cas(&held, 1, 0)) {
+		respond(test_held_opcode, test_held_status);
+	}
+}
+
 static void cmd_handle(struct net_buf *cmd)
 {
 	struct bt_hci_cmd_hdr *chdr;
-	struct net_buf *evt;
 	uint16_t opcode;
-	uint8_t *rp;
 
 	chdr = net_buf_pull_mem(cmd, sizeof(*chdr));
 	opcode = sys_le16_to_cpu(chdr->opcode);
@@ -317,52 +397,13 @@ static void cmd_handle(struct net_buf *cmd)
 		break;
 	}
 
-	rp = cmd_complete(&evt, opcode, 1U, GENERIC_RP_SIZE);
-
-	switch (opcode) {
-	case BT_HCI_OP_READ_LOCAL_FEATURES: {
-		struct bt_hci_rp_read_local_features *features = (void *)rp;
-
-		/* LE supported and BR/EDR not supported */
-		features->features[4] = BIT(5) | BIT(6);
-		break;
-	}
-	case BT_HCI_OP_READ_SUPPORTED_COMMANDS: {
-		struct bt_hci_rp_read_supported_commands *commands = (void *)rp;
-
-		(void)memset(commands->commands, 0xFF, sizeof(commands->commands));
-		break;
-	}
-	case BT_HCI_OP_READ_BD_ADDR: {
-		struct bt_hci_rp_read_bd_addr *addr = (void *)rp;
-
-		(void)memset(&addr->bdaddr, 0x11, sizeof(addr->bdaddr));
-		break;
-	}
-	case BT_HCI_OP_LE_READ_BUFFER_SIZE: {
-		struct bt_hci_rp_le_read_buffer_size *size = (void *)rp;
-
-		size->le_max_len = sys_cpu_to_le16(LE_ACL_MAX_LEN);
-		size->le_max_num = LE_ACL_MAX_NUM;
-		break;
-	}
-	case BT_HCI_OP_LE_READ_LOCAL_FEATURES: {
-		struct bt_hci_rp_le_read_local_features *features = (void *)rp;
-
-		(void)memcpy(features->features, test_le_features, sizeof(features->features));
-		break;
-	}
-	case BT_HCI_OP_LE_READ_SUPP_STATES: {
-		struct bt_hci_rp_le_read_supp_states *states = (void *)rp;
-
-		(void)memset(states->le_states, 0xFF, sizeof(states->le_states));
-		break;
-	}
-	default:
-		break;
+	if (opcode == test_held_opcode) {
+		test_held_count++;
+		atomic_set(&held, 1);
+		return;
 	}
 
-	bt_hci_recv(hci_dev, evt);
+	respond(opcode, BT_HCI_ERR_SUCCESS);
 }
 
 static int send_err(const struct net_buf *buf)
@@ -457,6 +498,12 @@ void test_driver_reset(void)
 	test_disconnect = respond_at_once;
 	test_other = respond_at_once;
 	test_other_opcode = 0U;
+	test_held_opcode = 0U;
+	test_held_status = BT_HCI_ERR_SUCCESS;
+	test_held_count = 0U;
+	atomic_set(&held, 0);
+	test_hci_version = 0U;
+	test_no_public_addr = false;
 	test_log_len = 0U;
 	test_acl_count = 0U;
 	test_reset_count = 0U;
