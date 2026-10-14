@@ -728,6 +728,16 @@ static void cmd_op_sent(struct net_buf *buf)
 	}
 }
 
+/* Whether the controller may refuse the command that an operation is at
+ * without ending the sequence that it goes through
+ */
+static bool cmd_op_optional(const struct bt_hci_cmd_op *op)
+{
+	const struct bt_hci_cmd_seq *seq = cmd_op_seq(op);
+
+	return seq != NULL && (seq->steps[op->step].flags & BT_HCI_CMD_STEP_OPTIONAL) != 0U;
+}
+
 /* The response of the controller to the command of an operation. The handler
  * of the return parameters gets them while the event is at hand, before the
  * command buffer is released and the operation handed back, so that what it
@@ -738,16 +748,28 @@ static int cmd_op_rsp(struct bt_hci_cmd_op *op, uint8_t status, struct net_buf *
 	const struct bt_hci_cmd_seq *seq = cmd_op_seq(op);
 	/* That of its step, for an operation that goes through a sequence */
 	bt_hci_cmd_rsp_t rsp = (seq != NULL) ? seq->steps[op->step].rsp : op->desc->rsp;
-	int err;
+	int err = 0;
 
 	op->status = status;
 
-	if (status != BT_HCI_ERR_SUCCESS || rsp == NULL) {
-		return status;
+	if (status != BT_HCI_ERR_SUCCESS) {
+		if (!cmd_op_optional(op)) {
+			return status;
+		}
+
+		LOG_DBG("opcode 0x%04x status 0x%02x %s, going on", cmd_op_opcode(op), status,
+			bt_hci_err_to_str(status));
 	}
 
-	err = rsp(op, evt);
-	__ASSERT(err <= 0, "Handler of opcode 0x%04x returned %d", cmd_op_opcode(op), err);
+	if (rsp != NULL) {
+		err = rsp(op, evt);
+		__ASSERT(err <= 0, "Handler of opcode 0x%04x returned %d", cmd_op_opcode(op), err);
+	}
+
+	/* The handler of an optional step has been told of the refusal, which is
+	 * not what the sequence completes with
+	 */
+	op->status = BT_HCI_ERR_SUCCESS;
 
 	return err;
 }
