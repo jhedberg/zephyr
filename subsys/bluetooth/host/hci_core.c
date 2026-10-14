@@ -217,10 +217,8 @@ struct cmd_data {
 	/** Used by bt_hci_cmd_send_sync. */
 	struct k_sem *sync;
 
-#if defined(CONFIG_BT_CONN)
 	/** Asynchronous operation that the buffer was encoded for, if any */
 	struct bt_hci_cmd_op *op;
-#endif /* CONFIG_BT_CONN */
 };
 
 static struct cmd_data cmd_data[BT_BUF_CMD_TX_COUNT];
@@ -273,11 +271,9 @@ static bool cmd_allowed;
 
 static bool cmd_work_pending(void)
 {
-#if defined(CONFIG_BT_CONN)
 	if (!sys_slist_is_empty(&bt_dev.cmd_op_queue)) {
 		return true;
 	}
-#endif /* CONFIG_BT_CONN */
 
 	return bt_dev.sent_cmd != NULL || !sys_slist_is_empty(&bt_dev.cmd_tx_queue);
 }
@@ -313,7 +309,6 @@ static void cmd_deadline_start(void)
  * command complete or command status.
  */
 #define CMD_BUF_SIZE MAX(BT_BUF_EVT_RX_SIZE, BT_BUF_CMD_TX_SIZE)
-#if defined(CONFIG_BT_CONN)
 /* A freed command buffer that is kept for the queued asynchronous commands
  * instead of going back to the pool. Protected by cmd_lock.
  */
@@ -374,9 +369,6 @@ static void hci_cmd_pool_destroy(struct net_buf *buf)
 }
 
 #define HCI_CMD_POOL_DESTROY hci_cmd_pool_destroy
-#else
-#define HCI_CMD_POOL_DESTROY NULL
-#endif /* CONFIG_BT_CONN */
 
 NET_BUF_POOL_FIXED_DEFINE(hci_cmd_pool, BT_BUF_CMD_TX_COUNT, CMD_BUF_SIZE, 0, HCI_CMD_POOL_DESTROY);
 
@@ -554,9 +546,7 @@ static void cmd_buf_prepare(struct net_buf *buf)
 	cmd(buf)->err = 0;
 	cmd(buf)->sync = NULL;
 	cmd(buf)->state = NULL;
-#if defined(CONFIG_BT_CONN)
 	cmd(buf)->op = NULL;
-#endif /* CONFIG_BT_CONN */
 }
 
 struct net_buf *bt_hci_cmd_alloc(k_timeout_t timeout)
@@ -576,7 +566,6 @@ struct net_buf *bt_hci_cmd_alloc(k_timeout_t timeout)
 	return buf;
 }
 
-#if defined(CONFIG_BT_CONN)
 /* Asynchronous HCI command operations. An operation is caller-owned storage
  * for one command: it is queued without a command buffer, gets its buffer and
  * its parameters from the TX processor, and then takes the path of every
@@ -795,33 +784,6 @@ static int cmd_op_rsp(struct bt_hci_cmd_op *op, uint8_t status, struct net_buf *
 
 	return err;
 }
-#else
-static struct bt_hci_cmd_op *cmd_op_detach(struct net_buf *buf)
-{
-	ARG_UNUSED(buf);
-
-	return NULL;
-}
-
-static void cmd_op_sent(struct net_buf *buf)
-{
-	ARG_UNUSED(buf);
-}
-
-static void cmd_op_complete(struct bt_hci_cmd_op *op, int result)
-{
-	ARG_UNUSED(op);
-	ARG_UNUSED(result);
-}
-
-static int cmd_op_rsp(struct bt_hci_cmd_op *op, uint8_t status, struct net_buf *evt)
-{
-	ARG_UNUSED(op);
-	ARG_UNUSED(evt);
-
-	return status;
-}
-#endif /* CONFIG_BT_CONN */
 
 /* Take the command that is with the controller: buf if it still is that
  * command, whichever it is if buf is NULL. The caller that gets it completes
@@ -962,7 +924,6 @@ static bool cmd_tx_queue_put(struct net_buf *buf)
 	return open;
 }
 
-#if defined(CONFIG_BT_CONN)
 /* Take the operations that have no buffer yet off their queue, to be
  * completed with cmd_ops_complete() once cmd_lock has been released. Called
  * with cmd_lock held. They are told to be on their way to completion, so
@@ -1021,7 +982,6 @@ static void cmd_ops_complete(sys_slist_t *ops, int err)
 		cmd_op_complete(op, err);
 	}
 }
-#endif /* CONFIG_BT_CONN */
 
 /* Drop every queued command, completing each with err: the HCI transport has
  * been closed, the controller has been given up on, or nothing could be sent
@@ -1032,30 +992,24 @@ static void hci_cmd_queue_purge(int err)
 	k_spinlock_key_t key;
 	sys_slist_t queue;
 	sys_snode_t *node;
-#if defined(CONFIG_BT_CONN)
 	struct net_buf *kept;
 	sys_slist_t buffered;
 	sys_slist_t ops;
-#endif /* CONFIG_BT_CONN */
 
 	key = k_spin_lock(&bt_dev.cmd_lock);
 	queue = bt_dev.cmd_tx_queue;
 	sys_slist_init(&bt_dev.cmd_tx_queue);
-#if defined(CONFIG_BT_CONN)
 	cmd_ops_take_buffered(&queue, &buffered);
 	cmd_ops_take(&ops);
 
 	kept = cmd_op_buf;
 	cmd_op_buf = NULL;
-#endif /* CONFIG_BT_CONN */
 	cmd_deadline_restart();
 	k_spin_unlock(&bt_dev.cmd_lock, key);
 
-#if defined(CONFIG_BT_CONN)
 	if (kept != NULL) {
 		net_buf_unref(kept);
 	}
-#endif /* CONFIG_BT_CONN */
 
 	while (true) {
 		struct net_buf *buf;
@@ -1072,7 +1026,6 @@ static void hci_cmd_queue_purge(int err)
 		cmd_complete_local(buf, err);
 	}
 
-#if defined(CONFIG_BT_CONN)
 	/* Logged with their buffers above */
 	while (true) {
 		node = sys_slist_get(&buffered);
@@ -1084,8 +1037,6 @@ static void hci_cmd_queue_purge(int err)
 	}
 
 	cmd_ops_complete(&ops, err);
-#endif /* CONFIG_BT_CONN */
-
 	/* A sender in the system workqueue may be waiting for the credit for a
 	 * command that is gone now.
 	 */
@@ -1145,7 +1096,6 @@ static void cmd_deadline_expired(struct k_timer *timer)
 		 * response can be mismatched: what waits to be sent is given
 		 * up, the controller is not.
 		 */
-#if defined(CONFIG_BT_CONN)
 		/* A sequence that waits for its buffer holds back what is
 		 * queued behind it, which may well have buffers: give the
 		 * sequence up alone and let the rest go. Only when nothing has
@@ -1167,7 +1117,6 @@ static void cmd_deadline_expired(struct k_timer *timer)
 		}
 
 		cmd_seq_given_up = false;
-#endif /* CONFIG_BT_CONN */
 		k_spin_unlock(&bt_dev.cmd_lock, key);
 
 		hci_cmd_queue_purge(-ENOBUFS);
@@ -1267,7 +1216,6 @@ int bt_hci_cmd_send(uint16_t opcode, struct net_buf *buf)
 	return 0;
 }
 
-#if defined(CONFIG_BT_CONN)
 /* Put the command that an operation is at into the buffer, which for a
  * sequence is the first of its remaining steps that has something to send.
  * Called with cmd_lock held, on the TX processor. Returns the opcode of the
@@ -1722,35 +1670,6 @@ int bt_hci_cmd_op_cancel(struct bt_hci_cmd_op *op)
 
 	return 0;
 }
-#else
-static void cmd_ops_dispatch(void)
-{
-}
-
-static bool cmd_seq_waiting(void)
-{
-	return false;
-}
-
-static bool cmd_seq_lets(const struct net_buf *buf)
-{
-	ARG_UNUSED(buf);
-
-	return true;
-}
-
-static void cmd_op_applied(const struct bt_hci_cmd_op *op)
-{
-	ARG_UNUSED(op);
-}
-
-static int cmd_op_continue(struct bt_hci_cmd_op *op)
-{
-	ARG_UNUSED(op);
-
-	return 1;
-}
-#endif /* CONFIG_BT_CONN */
 
 static bool process_pending_cmd(k_timeout_t timeout);
 
@@ -2009,7 +1928,6 @@ int bt_hci_cmd_send_sync(uint16_t opcode, struct net_buf *buf,
 	return 0;
 }
 
-#if defined(CONFIG_BT_CONN)
 int bt_hci_cmd_op_result(struct bt_hci_cmd_op *op, int result)
 {
 	uint16_t opcode = cmd_op_opcode(op);
@@ -2066,7 +1984,6 @@ int bt_hci_cmd_op_wait(struct bt_hci_cmd_op *op)
 	/* The operation is the caller's again */
 	return bt_hci_cmd_op_result(op, fut->result);
 }
-#endif /* CONFIG_BT_CONN */
 
 int bt_hci_le_rand(void *buffer, size_t len)
 {
@@ -4965,9 +4882,7 @@ static bool hci_core_send_cmd(void)
 	 */
 	bt_dev.sent_cmd = net_buf_ref(buf);
 	cmd_deadline_restart();
-#if defined(CONFIG_BT_CONN)
 	cmd_seq_given_up = false;
-#endif /* CONFIG_BT_CONN */
 
 	k_spin_unlock(&bt_dev.cmd_lock, key);
 
@@ -6565,9 +6480,7 @@ int bt_enable(bt_ready_cb_t cb)
 	}
 	cmd_allowed = !IS_ENABLED(CONFIG_BT_WAIT_NOP);
 	sys_slist_init(&bt_dev.cmd_tx_queue);
-#if defined(CONFIG_BT_CONN)
 	sys_slist_init(&bt_dev.cmd_op_queue);
-#endif /* CONFIG_BT_CONN */
 	atomic_clear_bit(bt_dev.flags, BT_DEV_CMD_FAILED);
 
 	if (IS_ENABLED(CONFIG_BT_HCI_SET_PUBLIC_ADDR)) {
