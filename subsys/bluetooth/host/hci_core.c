@@ -6069,14 +6069,17 @@ static const struct init_stage {
 	{ .seq = &bt_id_init_addr_seq },
 };
 
-/* The asynchronous enable that is on its way. Only bt_enable() writes it, and
- * only bt_init_stage_done() and init_work() read it until the enable has
- * completed.
+/* The asynchronous enable that is on its way: set up by enable_async(), then
+ * used by bt_init_stage_done(), init_done() and init_work() until the enable
+ * has ended.
  */
 static struct {
 	/* What the sequences of the stages are sent with */
 	struct bt_hci_cmd_op op;
-	/* Told the result */
+	/* Told the result: the future of bt_enable_async(), or else the
+	 * callback of bt_enable()
+	 */
+	struct bt_future *fut;
 	bt_ready_cb_t ready_cb;
 	/* The result, which init_work() ends the enable with */
 	int err;
@@ -6101,12 +6104,21 @@ static int init_finish(int err)
 	return err;
 }
 
-/* The asynchronous enable has got through its stages, or failed. It ends on
- * the system workqueue right before the callback is called, as it always did:
- * until then bt_disable() returns -EAGAIN and bt_enable() -EALREADY.
+/* The asynchronous enable has got through its stages, or failed. It ends right
+ * before it tells the result: here for the future, on the system workqueue for
+ * the callback, as it always did. Until then bt_disable() returns -EAGAIN and
+ * bt_enable() -EALREADY.
  */
 static void init_done(int err)
 {
+	struct bt_future *fut = enabling.fut;
+
+	if (fut != NULL) {
+		/* A new enable may start once this one has ended */
+		bt_future_complete(fut, init_finish(err));
+		return;
+	}
+
 	enabling.err = err;
 
 	k_work_submit(&bt_dev.init);
@@ -6493,7 +6505,11 @@ void bt_testing_set_iso_mtu(uint16_t mtu)
 }
 #endif /* CONFIG_BT_TESTING && CONFIG_BT_ISO */
 
-int bt_enable(bt_ready_cb_t cb)
+/* What every form of the enable does first, in its caller: the checks, and the
+ * transport opened. Once this has succeeded, the enable is on its way and ends
+ * in init_finish().
+ */
+static int enable_open(void)
 {
 	int err;
 
@@ -6583,16 +6599,33 @@ int bt_enable(bt_ready_cb_t cb)
 
 	bt_monitor_send(BT_MONITOR_OPEN_INDEX, NULL, 0);
 
-	if (cb == NULL) {
-		err = init_prepare();
-		if (err) {
-			return init_finish(err);
-		}
+	return 0;
 
-		return init_sync();
+failed:
+	atomic_clear_bit(bt_dev.flags, BT_DEV_ENABLING);
+	return err;
+}
+
+/* The asynchronous enable, which bt_enable_async() and bt_enable(cb) share:
+ * the stages go from one to the next as the controller responds, and the
+ * result goes to the future or to the callback.
+ */
+static int enable_async(struct bt_future *fut, bt_ready_cb_t ready_cb)
+{
+	int err;
+
+	err = enable_open();
+	if (err != 0) {
+		return err;
 	}
 
-	enabling.ready_cb = cb;
+	/* Only now, so that a call that fails leaves the future alone */
+	if (fut != NULL) {
+		bt_future_init(fut);
+	}
+
+	enabling.fut = fut;
+	enabling.ready_cb = ready_cb;
 	enabling.stage = 0U;
 
 	/* From here on the result goes where that of the stages goes */
@@ -6601,15 +6634,44 @@ int bt_enable(bt_ready_cb_t cb)
 		err = bt_hci_cmd_send_seq_cb(&enabling.op, init_stages[0].seq);
 	}
 
-	if (err) {
+	if (err != 0) {
 		init_done(err);
 	}
 
 	return 0;
+}
 
-failed:
-	atomic_clear_bit(bt_dev.flags, BT_DEV_ENABLING);
-	return err;
+int bt_enable_async(struct bt_future *fut)
+{
+	__ASSERT_NO_MSG(fut != NULL);
+
+	return enable_async(fut, NULL);
+}
+
+int bt_enable(bt_ready_cb_t cb)
+{
+	int err;
+
+	if (cb != NULL) {
+		return enable_async(NULL, cb);
+	}
+
+	/* The same stages, each waited for here. A wait for the future of
+	 * bt_enable_async() would block what resolves it on the Bluetooth
+	 * workqueue, and what sends the commands on the system workqueue of a
+	 * build without a TX processor thread: bt_enable(NULL) works on both.
+	 */
+	err = enable_open();
+	if (err != 0) {
+		return err;
+	}
+
+	err = init_prepare();
+	if (err != 0) {
+		return init_finish(err);
+	}
+
+	return init_sync();
 }
 
 int bt_disable(void)
