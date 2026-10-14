@@ -143,42 +143,6 @@ static int hci_df_set_cl_cte_tx_params(const struct bt_le_ext_adv *adv,
  *
  * @return Zero in case of success, other value in case of failure.
  */
-static int hci_df_read_ant_info(uint8_t *switch_sample_rates,
-				uint8_t *num_ant,
-				uint8_t *max_switch_pattern_len,
-				uint8_t *max_cte_len)
-{
-	__ASSERT_NO_MSG(switch_sample_rates);
-	__ASSERT_NO_MSG(num_ant);
-	__ASSERT_NO_MSG(max_switch_pattern_len);
-	__ASSERT_NO_MSG(max_cte_len);
-
-	struct bt_hci_rp_le_read_ant_info *rp;
-	struct net_buf *rsp;
-	int err;
-
-	err = bt_hci_cmd_send_sync(BT_HCI_OP_LE_READ_ANT_INFO, NULL, &rsp);
-	if (err) {
-		LOG_ERR("Failed to read antenna information");
-		return err;
-	}
-
-	rp = (void *)rsp->data;
-
-	LOG_DBG("DF: sw. sample rates: %x ant num: %u , max sw. pattern len: %u,"
-		"max CTE len %d",
-		rp->switch_sample_rates, rp->num_ant, rp->max_switch_pattern_len, rp->max_cte_len);
-
-	*switch_sample_rates = rp->switch_sample_rates;
-	*num_ant = rp->num_ant;
-	*max_switch_pattern_len = rp->max_switch_pattern_len;
-	*max_cte_len = rp->max_cte_len;
-
-	net_buf_unref(rsp);
-
-	return 0;
-}
-
 /* @brief Function handles send of HCI command to enable or disables CTE
  *        transmission for given advertising set.
  *
@@ -904,24 +868,20 @@ static int hci_df_set_conn_cte_rsp_enable(struct bt_conn *conn, bool enable)
  *
  * @return Zero in case of success, other value in case of failure.
  */
-int le_df_init(void)
+int bt_df_read_ant_info_complete(struct bt_hci_cmd_op *op, struct net_buf *buf)
 {
-	uint8_t max_switch_pattern_len;
-	uint8_t switch_sample_rates;
-	uint8_t max_cte_len;
-	uint8_t num_ant;
-	int err;
+	struct bt_hci_rp_le_read_ant_info *rp = (void *)buf->data;
 
-	err = hci_df_read_ant_info(&switch_sample_rates, &num_ant,
-			     &max_switch_pattern_len, &max_cte_len);
-	if (err) {
-		return err;
-	}
+	ARG_UNUSED(op);
 
-	df_ant_info.max_switch_pattern_len = max_switch_pattern_len;
-	df_ant_info.switch_sample_rates = switch_sample_rates;
-	df_ant_info.max_cte_len = max_cte_len;
-	df_ant_info.num_ant = num_ant;
+	LOG_DBG("DF: sw. sample rates: %x ant num: %u , max sw. pattern len: %u,"
+		"max CTE len %d",
+		rp->switch_sample_rates, rp->num_ant, rp->max_switch_pattern_len, rp->max_cte_len);
+
+	df_ant_info.max_switch_pattern_len = rp->max_switch_pattern_len;
+	df_ant_info.switch_sample_rates = rp->switch_sample_rates;
+	df_ant_info.max_cte_len = rp->max_cte_len;
+	df_ant_info.num_ant = rp->num_ant;
 
 	LOG_DBG("DF initialized.");
 	return 0;

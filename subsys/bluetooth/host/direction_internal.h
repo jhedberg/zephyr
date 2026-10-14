@@ -8,8 +8,10 @@
 #include <zephyr/bluetooth/direction.h>
 #include <zephyr/net_buf.h>
 
-/* Performs initialization of Direction Finding in Host */
-int le_df_init(void);
+struct bt_hci_cmd_op;
+
+/* Keeps the response to LE Read Antenna Information, a step of bt_enable() */
+int bt_df_read_ant_info_complete(struct bt_hci_cmd_op *op, struct net_buf *buf);
 
 int hci_df_prepare_connectionless_iq_report(struct net_buf *buf,
 					    struct bt_df_per_adv_sync_iq_samples_report *report,
