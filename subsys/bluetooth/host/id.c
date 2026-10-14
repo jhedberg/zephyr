@@ -2473,6 +2473,213 @@ int bt_le_oob_get_sc_data(struct bt_conn *conn,
 #endif /* !defined(CONFIG_BT_SMP_OOB_LEGACY_PAIR_ONLY) */
 #endif /* defined(CONFIG_BT_SMP) */
 
+/* The identities that bt_enable() takes from the controller when none was
+ * created before it, and when there are no settings to restore them from,
+ * which set them up when they are loaded. The steps below read them, and
+ * bt_id_init() then gives them their keys or creates one.
+ */
+static bool id_init_read;
+
+/* The identity is a random one that the controller is given at the end */
+static bool id_init_random;
+
+#if defined(CONFIG_BT_PRIVACY) && defined(CONFIG_BT_HCI_VS)
+/* The identity roots that the IRKs of the identities read are made from */
+static uint8_t id_init_ir[CONFIG_BT_ID_MAX][16];
+#endif
+
+static bool id_init_wanted(void)
+{
+	return !IS_ENABLED(CONFIG_BT_SETTINGS) && bt_dev.id_count == 0U;
+}
+
+static int id_init_bd_addr_encode(struct net_buf *buf, struct bt_hci_cmd_op *op)
+{
+	ARG_UNUSED(buf);
+	ARG_UNUSED(op);
+
+	id_init_read = false;
+	id_init_random = false;
+
+	if (!id_init_wanted()) {
+		return BT_HCI_CMD_SKIP;
+	}
+
+	LOG_DBG("No user identity. Trying to set public.");
+
+	return 0;
+}
+
+static int id_init_bd_addr_complete(struct bt_hci_cmd_op *op, struct net_buf *buf)
+{
+	struct bt_hci_rp_read_bd_addr *rp = (void *)buf->data;
+
+	if (bt_hci_cmd_op_status(op) != BT_HCI_ERR_SUCCESS) {
+		LOG_WRN("Failed to read public address");
+		return 0;
+	}
+
+	if (bt_addr_eq(&rp->bdaddr, BT_ADDR_ANY) || bt_addr_eq(&rp->bdaddr, BT_ADDR_NONE)) {
+		LOG_DBG("Controller has no public address");
+		return 0;
+	}
+
+	bt_addr_le_copy_addr(&bt_dev.id_addr[BT_ID_DEFAULT], &rp->bdaddr, BT_ADDR_LE_PUBLIC);
+	bt_dev.id_count = 1U;
+	id_init_read = true;
+
+	return 0;
+}
+
+#if defined(CONFIG_BT_HCI_VS)
+#if defined(CONFIG_BT_PRIVACY)
+/* The identity root of the public identity just read */
+static int id_init_ir_encode(struct net_buf *buf, struct bt_hci_cmd_op *op)
+{
+	ARG_UNUSED(buf);
+	ARG_UNUSED(op);
+
+	(void)memset(id_init_ir, 0, sizeof(id_init_ir));
+
+	if (!id_init_read || !BT_VS_CMD_READ_KEY_ROOTS(bt_dev.vs_commands)) {
+		return BT_HCI_CMD_SKIP;
+	}
+
+	return 0;
+}
+
+static int id_init_ir_complete(struct bt_hci_cmd_op *op, struct net_buf *buf)
+{
+	struct bt_hci_rp_vs_read_key_hierarchy_roots *rp = (void *)buf->data;
+
+	if (bt_hci_cmd_op_status(op) != BT_HCI_ERR_SUCCESS) {
+		LOG_WRN("Failed to read identity root");
+		return 0;
+	}
+
+	if (IS_ENABLED(CONFIG_BT_HCI_VS_EXT_DETECT) && buf->len != sizeof(*rp)) {
+		LOG_WRN("Invalid Vendor HCI extensions");
+		return 0;
+	}
+
+	memcpy(id_init_ir[BT_ID_DEFAULT], rp->ir, sizeof(rp->ir));
+
+	return 0;
+}
+#endif /* CONFIG_BT_PRIVACY */
+
+/* The static addresses of a controller without a public address */
+static int id_init_static_addrs_encode(struct net_buf *buf, struct bt_hci_cmd_op *op)
+{
+	ARG_UNUSED(buf);
+	ARG_UNUSED(op);
+
+	if (!id_init_wanted()) {
+		return BT_HCI_CMD_SKIP;
+	}
+
+	LOG_DBG("No public address. Trying to set static random.");
+
+	if (!BT_VS_CMD_READ_STATIC_ADDRS(bt_dev.vs_commands)) {
+		LOG_WRN("Read Static Addresses command not available");
+		return BT_HCI_CMD_SKIP;
+	}
+
+	return 0;
+}
+
+static int id_init_static_addrs_complete(struct bt_hci_cmd_op *op, struct net_buf *buf)
+{
+	struct bt_hci_rp_vs_read_static_addrs *rp = (void *)buf->data;
+	uint8_t cnt;
+
+	if (bt_hci_cmd_op_status(op) != BT_HCI_ERR_SUCCESS) {
+		LOG_WRN("Failed to read static addresses");
+		return 0;
+	}
+
+	if (IS_ENABLED(CONFIG_BT_HCI_VS_EXT_DETECT) &&
+	    (buf->len < sizeof(*rp) ||
+	     buf->len != sizeof(*rp) + rp->num_addrs * sizeof(struct bt_hci_vs_static_addr))) {
+		LOG_WRN("Invalid Vendor HCI extensions");
+		return 0;
+	}
+
+	cnt = MIN(rp->num_addrs, CONFIG_BT_ID_MAX);
+	if (cnt == 0U) {
+		LOG_WRN("No static addresses stored in controller");
+		return 0;
+	}
+
+	for (uint8_t i = 0U; i < cnt; i++) {
+		bt_addr_le_copy_addr(&bt_dev.id_addr[i], &rp->a[i].bdaddr, BT_ADDR_LE_RANDOM);
+#if defined(CONFIG_BT_PRIVACY)
+		memcpy(id_init_ir[i], rp->a[i].ir, sizeof(rp->a[i].ir));
+#endif /* CONFIG_BT_PRIVACY */
+	}
+
+	bt_dev.id_count = cnt;
+	id_init_read = true;
+
+	return 0;
+}
+#endif /* CONFIG_BT_HCI_VS */
+
+static const struct bt_hci_cmd_step id_init_steps[] = {
+	{ .opcode = BT_HCI_OP_READ_BD_ADDR,
+	  .encode = id_init_bd_addr_encode, .rsp = id_init_bd_addr_complete,
+	  .flags = BT_HCI_CMD_STEP_OPTIONAL },
+	IF_ENABLED(CONFIG_BT_HCI_VS, (
+	IF_ENABLED(CONFIG_BT_PRIVACY, (
+	{ .opcode = BT_HCI_OP_VS_READ_KEY_HIERARCHY_ROOTS,
+	  .encode = id_init_ir_encode, .rsp = id_init_ir_complete,
+	  .flags = BT_HCI_CMD_STEP_OPTIONAL },
+	)) /* CONFIG_BT_PRIVACY */
+	{ .opcode = BT_HCI_OP_VS_READ_STATIC_ADDRS,
+	  .encode = id_init_static_addrs_encode, .rsp = id_init_static_addrs_complete,
+	  .flags = BT_HCI_CMD_STEP_OPTIONAL },
+	)) /* CONFIG_BT_HCI_VS */
+};
+
+const struct bt_hci_cmd_seq bt_id_init_seq = BT_HCI_CMD_SEQ_INIT(id_init_steps, bt_init_stage_done);
+
+/* The passive scanner just sends a dummy address type in the command. If the
+ * first activity does this, and the dummy type is a random address, it needs
+ * a valid value, even though it's not actually used.
+ */
+static int id_init_addr_encode(struct net_buf *buf, struct bt_hci_cmd_op *op)
+{
+	const bt_addr_t *addr = &bt_dev.id_addr[BT_ID_DEFAULT].a;
+
+	ARG_UNUSED(op);
+
+	if (!id_init_random || bt_addr_eq(addr, &bt_dev.random_addr)) {
+		return BT_HCI_CMD_SKIP;
+	}
+
+	net_buf_add_mem(buf, addr, sizeof(*addr));
+
+	return 0;
+}
+
+static int id_init_addr_complete(struct bt_hci_cmd_op *op, struct net_buf *buf)
+{
+	ARG_UNUSED(op);
+	ARG_UNUSED(buf);
+
+	bt_addr_copy(&bt_dev.random_addr, &bt_dev.id_addr[BT_ID_DEFAULT].a);
+
+	return 0;
+}
+
+static const struct bt_hci_cmd_step id_init_addr_steps[] = {
+	{ .opcode = BT_HCI_OP_LE_SET_RANDOM_ADDRESS,
+	  .encode = id_init_addr_encode, .rsp = id_init_addr_complete },
+};
+
+const struct bt_hci_cmd_seq bt_id_init_addr_seq =
+	BT_HCI_CMD_SEQ_INIT(id_init_addr_steps, bt_init_stage_done);
+
 int bt_id_init(void)
 {
 	int err;
@@ -2490,36 +2697,40 @@ int bt_id_init(void)
 #endif
 #endif
 
-	if (!IS_ENABLED(CONFIG_BT_SETTINGS) && !bt_dev.id_count) {
-		LOG_DBG("No user identity. Trying to set public.");
+	/* Created before bt_enable(), or restored from the settings later */
+	if (!id_init_read && !id_init_wanted()) {
+		return 0;
+	}
 
-		err = bt_setup_public_id_addr();
+	for (uint8_t i = 0U; i < bt_dev.id_count; i++) {
+		bt_addr_le_t addr = bt_dev.id_addr[i];
+		uint8_t *irk = NULL;
+#if defined(CONFIG_BT_PRIVACY) && defined(CONFIG_BT_HCI_VS)
+		uint8_t ir_irk[16];
+
+		if (!IS_ENABLED(CONFIG_BT_PRIVACY_RANDOMIZE_IR) &&
+		    bt_smp_irk_get(id_init_ir[i], ir_irk) == 0) {
+			irk = ir_irk;
+		}
+#endif
+
+		/* With privacy, a random IRK without an identity root */
+		err = id_create(i, &addr, irk);
 		if (err) {
 			LOG_ERR("Unable to set identity address");
 			return err;
 		}
 	}
 
-	if (!IS_ENABLED(CONFIG_BT_SETTINGS) && !bt_dev.id_count) {
-		LOG_DBG("No public address. Trying to set static random.");
-
-		err = bt_setup_random_id_addr();
-		if (err) {
+	if (bt_dev.id_count == 0U) {
+		err = bt_id_create(NULL, NULL);
+		if (err < 0) {
 			LOG_ERR("Unable to set identity address");
 			return err;
 		}
-
-		/* The passive scanner just sends a dummy address type in the
-		 * command. If the first activity does this, and the dummy type
-		 * is a random address, it needs a valid value, even though it's
-		 * not actually used.
-		 */
-		err = set_random_address(&bt_dev.id_addr[0].a);
-		if (err) {
-			LOG_ERR("Unable to set random address");
-			return err;
-		}
 	}
+
+	id_init_random = bt_dev.id_addr[BT_ID_DEFAULT].type == BT_ADDR_LE_RANDOM;
 
 	return 0;
 }
