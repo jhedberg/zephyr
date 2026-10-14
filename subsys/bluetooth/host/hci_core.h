@@ -605,6 +605,13 @@ struct bt_keys *bt_id_find_conflict(struct bt_keys *candidate);
 int bt_setup_random_id_addr(void);
 int bt_setup_public_id_addr(void);
 
+struct bt_hci_cmd_op;
+
+/* Completion callback of the sequences of commands that bt_enable() goes
+ * through, see init_stages in hci_core.c
+ */
+void bt_init_stage_done(struct bt_hci_cmd_op *op, int result);
+
 void bt_finalize_init(int err);
 
 void bt_hci_host_num_completed_packets(struct net_buf *buf);
