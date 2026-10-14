@@ -9,8 +9,9 @@
  * They cover the order and the leaving out of steps, the ways in which a
  * sequence ends before its last command and what is on record of the
  * controller then, that nothing gets in between the commands, two callers at
- * once, return parameters that the next step uses, and a caller that waits
- * for the whole of it on a workqueue.
+ * once, return parameters that the next step uses, responses that a step keeps
+ * or ends the sequence by, a step that the controller may refuse, and a
+ * caller that waits for the whole of it on a workqueue.
  */
 
 #include <errno.h>
@@ -946,6 +947,88 @@ static ZTEST(cmd_seq, test_callback_reads_answer)
 	zassert_ok(k_sem_take(&seq_cb_sem, K_SECONDS(1)), "The callback did not run");
 	zassert_equal(seq_cb_result, 0, "The result is %d", seq_cb_result);
 	zassert_equal(seq_cb_rp, 0x77, "The callback read 0x%02x", seq_cb_rp);
+}
+
+/* What the handler of a step was told: the status, and what it kept of the
+ * return parameters
+ */
+static uint8_t rsp_kept;
+static uint16_t rsp_len;
+static uint8_t rsp_status;
+
+static int keep_answer(struct bt_hci_cmd_op *op, struct net_buf *rp)
+{
+	rsp_status = bt_hci_cmd_op_status(op);
+	if (rsp_status != BT_HCI_ERR_SUCCESS) {
+		return 0;
+	}
+
+	rsp_len = rp->len;
+
+	/* The first byte is the status */
+	rsp_kept = (rp->len > 1U) ? rp->data[1] : 0U;
+
+	return 0;
+}
+
+/* A step whose command the controller need not support: a refusal does not
+ * end the sequence, the handler is told of it, and nothing is recorded.
+ */
+static ZTEST(cmd_seq, test_optional_step_refused)
+{
+	static const struct bt_hci_cmd_step steps[] = {
+		{ .opcode = TEST_OPCODE,
+		  .encode = read_encode, .state = &scan_enabled, .rsp = keep_answer,
+		  .flags = BT_HCI_CMD_STEP_OPTIONAL },
+		{ .opcode = BT_HCI_OP_LE_SET_SCAN_PARAM },
+	};
+	static const struct bt_hci_cmd_seq seq = BT_HCI_CMD_SEQ_INIT(steps, NULL);
+
+	test_cmd.status = BT_HCI_ERR_UNKNOWN_CMD;
+	test_other_opcode = BT_HCI_OP_LE_SET_SCAN_PARAM;
+	rsp_kept = 0U;
+	rsp_len = 0U;
+	rsp_status = BT_HCI_ERR_SUCCESS;
+
+	zassert_ok(bt_hci_cmd_send_seq_async(&request.cmd, &seq), "Sending the sequence failed");
+	zassert_ok(bt_future_wait(&request.cmd.fut, K_SECONDS(1)), "The sequence did not complete");
+	zassert_equal(request.cmd.fut.result, 0, "The result is %d", request.cmd.fut.result);
+	zassert_equal(bt_hci_cmd_op_step(&request.cmd.op), ARRAY_SIZE(steps),
+		      "The sequence stopped at step %u", bt_hci_cmd_op_step(&request.cmd.op));
+	zassert_equal(rsp_status, BT_HCI_ERR_UNKNOWN_CMD, "The handler was told 0x%02x",
+		      rsp_status);
+	zassert_equal(rsp_len, 0U, "The handler kept return parameters");
+	zassert_false(scanning(), "A refused command is on record");
+	EXPECT_SENT(TEST_OPCODE, BT_HCI_OP_LE_SET_SCAN_PARAM);
+}
+
+/* A refusal of the last command that a sequence sends is not its result
+ * either, also for a callback, which is told the result as the operation
+ * keeps it
+ */
+static ZTEST(cmd_seq, test_optional_step_refused_last)
+{
+	static const struct bt_hci_cmd_step steps[] = {
+		{ .opcode = BT_HCI_OP_LE_SET_SCAN_PARAM },
+		{ .opcode = TEST_OPCODE,
+		  .encode = read_encode, .rsp = keep_answer, .flags = BT_HCI_CMD_STEP_OPTIONAL },
+		{ .opcode = BT_HCI_OP_LE_SET_SCAN_ENABLE, .encode = scan_disable_encode },
+	};
+	static const struct bt_hci_cmd_seq seq = BT_HCI_CMD_SEQ_INIT(steps, seq_cb);
+
+	test_cmd.status = BT_HCI_ERR_UNKNOWN_CMD;
+	test_other_opcode = BT_HCI_OP_LE_SET_SCAN_PARAM;
+	rsp_status = BT_HCI_ERR_SUCCESS;
+	k_sem_reset(&seq_cb_sem);
+
+	/* The last step has nothing to send: the scanner does not run */
+	zassert_ok(bt_hci_cmd_send_seq_cb(&request.cmd.op, &seq), "Sending the sequence failed");
+	zassert_ok(k_sem_take(&seq_cb_sem, K_SECONDS(1)), "The callback did not run");
+	zassert_equal(seq_cb_result, 0, "The result is %d", seq_cb_result);
+	zassert_equal(seq_cb_step, ARRAY_SIZE(steps), "Told at step %u", seq_cb_step);
+	zassert_equal(rsp_status, BT_HCI_ERR_UNKNOWN_CMD, "The handler was told 0x%02x",
+		      rsp_status);
+	EXPECT_SENT(BT_HCI_OP_LE_SET_SCAN_PARAM, TEST_OPCODE);
 }
 
 static K_SEM_DEFINE(syswq_done, 0, 1);
