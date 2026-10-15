@@ -9,6 +9,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include <zephyr/bluetooth/addr.h>
 #include <zephyr/bluetooth/hci_types.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/kernel.h>
@@ -19,8 +20,8 @@
 /* The handle of the connection that test_connect() brings up */
 #define TEST_CONN_HANDLE 0x0001U
 
-/** What the test controller does with one command. It responds to every
- *  other command with success and one command credit from within send().
+/** What the test controller does with one command. It responds to a command
+ *  without a script with success and one command credit from within send().
  */
 struct test_cmd_script {
 	/** When the response comes: K_NO_WAIT from within send(), K_FOREVER never */
@@ -37,6 +38,10 @@ struct test_cmd_script {
 	bool echo;
 	/** What send() returns instead of taking the command, if not 0 */
 	int send_err;
+	/** The controller keeps the buffer of the command, as a driver may,
+	 *  until the next test_driver_reset() (test_other only)
+	 */
+	bool keep;
 	/** How often the controller has been given the command */
 	unsigned int count;
 };
@@ -51,6 +56,34 @@ extern uint8_t test_cmd_plen[4];
  *  Disconnection Complete event when the status is success.
  */
 extern struct test_cmd_script test_disconnect;
+
+/** One more command, which a test picks by setting its opcode, whose response
+ *  is a Command Status event. test_driver_reset() picks none.
+ */
+extern uint16_t test_other_opcode;
+extern struct test_cmd_script test_other;
+
+/** Parameters of the last command with test_other_opcode */
+extern uint8_t test_other_params[32];
+
+/** The opcodes of the commands that the controller has been given, in order,
+ *  since the last test_driver_reset() or since a test set the length to zero.
+ */
+extern uint16_t test_log[16];
+extern unsigned int test_log_len;
+
+/** LE features that the controller reports. Not touched by test_driver_reset() */
+extern uint8_t test_le_features[8];
+
+/** How many ACL packets the controller has been given since the last
+ *  test_driver_reset(), and the first bytes of the last one behind its ACL
+ *  header, which is where the L2CAP header starts.
+ */
+extern unsigned int test_acl_count;
+extern uint8_t test_acl_data[8];
+
+/** The peer of the connection that the test controller reports */
+extern const bt_addr_le_t test_peer;
 
 /** How often the controller has been reset and the transport closed */
 extern unsigned int test_reset_count;
@@ -77,7 +110,19 @@ bool test_without_reset(const void *state);
 /** Deliver an LE Connection Complete event for TEST_CONN_HANDLE, peripheral role */
 void test_connect(void);
 
+/** The same in the central role, for a connection that the Host is creating */
+void test_connect_central(void);
+
+/** Deliver an Encryption Change event for TEST_CONN_HANDLE */
+void test_encrypt_change(uint8_t status);
+
+/** Deliver an L2CAP PDU from the peer of TEST_CONN_HANDLE */
+void test_acl_recv(uint16_t cid, const uint8_t *data, uint8_t len);
+
 /** Deliver a Disconnection Complete event for TEST_CONN_HANDLE */
 void test_disconnect_complete(uint8_t reason);
+
+/** Deliver an LE Read Remote Features Complete event for TEST_CONN_HANDLE */
+void test_remote_features(const uint8_t features[8]);
 
 #endif /* TESTS_BLUETOOTH_HOST_CMD_SRC_DRIVER_H_ */

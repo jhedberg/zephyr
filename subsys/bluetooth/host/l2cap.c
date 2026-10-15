@@ -1181,7 +1181,13 @@ static void le_conn_param_update_req(struct bt_l2cap *l2cap, uint8_t ident,
 	l2cap_send_sig(conn, buf);
 
 	if (accepted) {
-		bt_conn_le_conn_update(conn, &param);
+		int err;
+
+		/* Not waited for on the Bluetooth workqueue */
+		err = bt_conn_le_conn_update_nowait(conn, &param);
+		if (err != 0) {
+			LOG_WRN("Unable to update the connection parameters (err %d)", err);
+		}
 	}
 }
 

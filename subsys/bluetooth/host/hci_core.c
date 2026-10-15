@@ -565,6 +565,33 @@ static struct bt_future *cmd_op_fut(struct bt_hci_cmd_op *op)
 	return &CONTAINER_OF(op, struct bt_hci_cmd_op_fut, op)->fut;
 }
 
+/* The sequence that an operation was sent with, if it was sent with one */
+static const struct bt_hci_cmd_seq *cmd_op_seq(const struct bt_hci_cmd_op *op)
+{
+	if (op->seq == 0U) {
+		return NULL;
+	}
+
+	return CONTAINER_OF(op->desc, struct bt_hci_cmd_seq, desc);
+}
+
+/* The opcode of the command that an operation is at, for the log */
+static uint16_t cmd_op_opcode(const struct bt_hci_cmd_op *op)
+{
+	const struct bt_hci_cmd_seq *seq = cmd_op_seq(op);
+
+	if (seq == NULL) {
+		return op->desc->opcode;
+	}
+
+	return seq->steps[MIN(op->step, seq->num_steps - 1U)].opcode;
+}
+
+/* The sequence that is on its way, from its first command to its completion.
+ * Protected by cmd_lock.
+ */
+static struct bt_hci_cmd_op *cmd_seq_op;
+
 static void cmd_done_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
@@ -615,8 +642,18 @@ static void cmd_op_complete(struct bt_hci_cmd_op *op, int result)
 	struct bt_future *fut = NULL;
 	k_spinlock_key_t key;
 	uint16_t opcode;
+	bool wake_tx;
 
 	key = k_spin_lock(&bt_dev.cmd_lock);
+
+	/* What has waited for the sequence to end can go on. Not every way
+	 * here has the TX processor run afterwards: the command deadline
+	 * gives a sequence up from its timer.
+	 */
+	wake_tx = (cmd_seq_op == op);
+	if (wake_tx) {
+		cmd_seq_op = NULL;
+	}
 
 	if (op->kind == CMD_OP_KIND_CB && op->desc->done != NULL) {
 		op->err = (result < 0) ? (uint8_t)-result : 0U;
@@ -626,6 +663,10 @@ static void cmd_op_complete(struct bt_hci_cmd_op *op, int result)
 		k_spin_unlock(&bt_dev.cmd_lock, key);
 
 		(void)bt_work_submit(&cmd_done_work);
+
+		if (wake_tx) {
+			bt_tx_irq_raise();
+		}
 
 		return;
 	}
@@ -637,7 +678,7 @@ static void cmd_op_complete(struct bt_hci_cmd_op *op, int result)
 		fut = cmd_op_fut(op);
 	}
 
-	opcode = op->desc->opcode;
+	opcode = cmd_op_opcode(op);
 	op->state = CMD_OP_IDLE;
 
 	k_spin_unlock(&bt_dev.cmd_lock, key);
@@ -647,6 +688,10 @@ static void cmd_op_complete(struct bt_hci_cmd_op *op, int result)
 	} else if (result != 0) {
 		/* Nobody else reports the failure */
 		LOG_WRN("opcode 0x%04x failed (%d)", opcode, result);
+	}
+
+	if (wake_tx) {
+		bt_tx_irq_raise();
 	}
 }
 
@@ -682,16 +727,19 @@ static void cmd_op_sent(struct net_buf *buf)
  */
 static int cmd_op_rsp(struct bt_hci_cmd_op *op, uint8_t status, struct net_buf *evt)
 {
+	const struct bt_hci_cmd_seq *seq = cmd_op_seq(op);
+	/* That of its step, for an operation that goes through a sequence */
+	bt_hci_cmd_rsp_t rsp = (seq != NULL) ? seq->steps[op->step].rsp : op->desc->rsp;
 	int err;
 
 	op->status = status;
 
-	if (status != BT_HCI_ERR_SUCCESS || op->desc->rsp == NULL) {
+	if (status != BT_HCI_ERR_SUCCESS || rsp == NULL) {
 		return status;
 	}
 
-	err = op->desc->rsp(op, evt);
-	__ASSERT(err <= 0, "Handler of opcode 0x%04x returned %d", op->desc->opcode, err);
+	err = rsp(op, evt);
+	__ASSERT(err <= 0, "Handler of opcode 0x%04x returned %d", cmd_op_opcode(op), err);
 
 	return err;
 }
@@ -916,7 +964,7 @@ static void cmd_ops_complete(sys_slist_t *ops, int err)
 
 		op = CONTAINER_OF(node, struct bt_hci_cmd_op, node);
 
-		LOG_WRN("Dropping queued command 0x%04x (%d)", op->desc->opcode, err);
+		LOG_WRN("Dropping queued command 0x%04x (%d)", cmd_op_opcode(op), err);
 
 		cmd_op_complete(op, err);
 	}
@@ -1152,6 +1200,146 @@ int bt_hci_cmd_send(uint16_t opcode, struct net_buf *buf)
 }
 
 #if defined(CONFIG_BT_CONN)
+/* Put the command that an operation is at into the buffer, which for a
+ * sequence is the first of its remaining steps that has something to send.
+ * Called with cmd_lock held, on the TX processor. Returns the opcode of the
+ * command, 0 if a sequence has nothing left to send, or a negative value if
+ * the encoder refused.
+ */
+static int cmd_op_encode(struct bt_hci_cmd_op *op, struct net_buf *buf)
+{
+	const struct bt_hci_cmd_seq *seq = cmd_op_seq(op);
+	int err;
+
+	if (seq == NULL) {
+		err = (op->desc->encode != NULL) ? op->desc->encode(buf, op) : 0;
+
+		return (err == 0) ? (int)op->desc->opcode : -ECANCELED;
+	}
+
+	while (op->step < seq->num_steps) {
+		const struct bt_hci_cmd_step *step = &seq->steps[op->step];
+
+		err = (step->encode != NULL) ? step->encode(buf, op) : 0;
+		if (err == 0) {
+			return step->opcode;
+		}
+
+		if (err != BT_HCI_CMD_SKIP) {
+			return -ECANCELED;
+		}
+
+		op->step++;
+	}
+
+	return 0;
+}
+
+/* Whether the operation at the head of the queue can get its command now.
+ * The steps of a sequence decide what to send by what they find, so a
+ * sequence only starts when nothing is ahead of it: no command with the
+ * controller or queued, and no other sequence on its way. Nothing else gets
+ * its command either while a sequence is on its way, as it would be encoded
+ * in the middle of what the sequence changes. Called with cmd_lock held.
+ */
+static bool cmd_op_can_dispatch(void)
+{
+	sys_snode_t *node = sys_slist_peek_head(&bt_dev.cmd_op_queue);
+	struct bt_hci_cmd_op *op;
+
+	if (node == NULL) {
+		return false;
+	}
+
+	op = CONTAINER_OF(node, struct bt_hci_cmd_op, node);
+
+	if (cmd_seq_op != NULL) {
+		return op == cmd_seq_op;
+	}
+
+	if (cmd_op_seq(op) != NULL) {
+		return bt_dev.sent_cmd == NULL && sys_slist_is_empty(&bt_dev.cmd_tx_queue);
+	}
+
+	return true;
+}
+
+/* The sequence that is on its way is between two of its commands and waits
+ * for its buffer. Called with cmd_lock held.
+ */
+static bool cmd_seq_waiting(void)
+{
+	return cmd_seq_op != NULL && cmd_seq_op->state == CMD_OP_QUEUED;
+}
+
+/* Whether a queued command may be handed to the driver. While a sequence is
+ * on its way only its own commands are, so that they stay together: also
+ * while the response to one of them is being processed and the next one has
+ * not been encoded yet. Called with cmd_lock held.
+ */
+static bool cmd_seq_lets(const struct net_buf *buf)
+{
+	return cmd_seq_op == NULL || cmd(buf)->op == cmd_seq_op;
+}
+
+/* The controller has done what the command of an operation asked for. A step
+ * of a sequence that keeps a flag of that gets it now rather than with the
+ * completion, which a sequence only has at its end and may never get to: what
+ * the controller sends next may depend on the flag, and so does the next
+ * sequence.
+ */
+static void cmd_op_applied(const struct bt_hci_cmd_op *op)
+{
+	const struct bt_hci_cmd_seq *seq = cmd_op_seq(op);
+	const struct bt_hci_cmd_state_set *state;
+
+	if (seq == NULL) {
+		return;
+	}
+
+	state = seq->steps[op->step].state;
+	if (state != NULL) {
+		atomic_set_bit_to(state->target, state->bit, state->val);
+	}
+}
+
+/* A command of an operation has succeeded. If it was not the last one of a
+ * sequence, the operation goes back to the head of the queue for its next
+ * command. The caller releases the buffer of the command afterwards, which
+ * hci_cmd_pool_destroy() then keeps for it. Returns 0 if the sequence goes
+ * on, 1 if the operation is complete, or what it failed with.
+ */
+static int cmd_op_continue(struct bt_hci_cmd_op *op)
+{
+	const struct bt_hci_cmd_seq *seq = cmd_op_seq(op);
+	k_spinlock_key_t key;
+
+	if (seq == NULL) {
+		return 1;
+	}
+
+	key = k_spin_lock(&bt_dev.cmd_lock);
+
+	op->step++;
+	if (op->step >= seq->num_steps) {
+		k_spin_unlock(&bt_dev.cmd_lock, key);
+		return 1;
+	}
+
+	if (!cmd_admission_open()) {
+		k_spin_unlock(&bt_dev.cmd_lock, key);
+		return -EHOSTDOWN;
+	}
+
+	op->state = CMD_OP_QUEUED;
+	sys_slist_prepend(&bt_dev.cmd_op_queue, &op->node);
+	cmd_deadline_start();
+
+	k_spin_unlock(&bt_dev.cmd_lock, key);
+
+	return 0;
+}
+
 /* Take the buffer that hci_cmd_pool_destroy() kept for the operations */
 static struct net_buf *cmd_op_buf_take(void)
 {
@@ -1183,7 +1371,20 @@ static void cmd_ops_dispatch(void)
 		k_spinlock_key_t key;
 		struct net_buf *buf;
 		sys_snode_t *node;
+		bool can_dispatch;
+		int opcode;
 		int err;
+
+		/* Looked at before a buffer is taken: one that is given back
+		 * comes straight back here.
+		 */
+		key = k_spin_lock(&bt_dev.cmd_lock);
+		can_dispatch = cmd_op_can_dispatch();
+		k_spin_unlock(&bt_dev.cmd_lock, key);
+
+		if (!can_dispatch) {
+			return;
+		}
 
 		buf = cmd_op_buf_take();
 		if (buf == NULL) {
@@ -1196,9 +1397,13 @@ static void cmd_ops_dispatch(void)
 
 		key = k_spin_lock(&bt_dev.cmd_lock);
 
-		node = cmd_admission_open() ? sys_slist_get(&bt_dev.cmd_op_queue) : NULL;
+		node = (cmd_admission_open() && cmd_op_can_dispatch())
+			       ? sys_slist_get(&bt_dev.cmd_op_queue)
+			       : NULL;
 		if (node == NULL) {
-			/* Canceled or purged meanwhile */
+			/* Canceled or purged meanwhile, or something has got
+			 * ahead of a sequence that was about to start.
+			 */
 			k_spin_unlock(&bt_dev.cmd_lock, key);
 			net_buf_unref(buf);
 			return;
@@ -1214,10 +1419,8 @@ static void cmd_ops_dispatch(void)
 		op->state = CMD_OP_ENCODING;
 		k_spin_unlock(&bt_dev.cmd_lock, key);
 
-		err = (op->desc->encode != NULL) ? op->desc->encode(buf, op) : 0;
-		if (err == 0) {
-			err = bt_hci_pkt_push_cmd_hdr(&buf->b, op->desc->opcode);
-		}
+		opcode = cmd_op_encode(op, buf);
+		err = (opcode > 0) ? bt_hci_pkt_push_cmd_hdr(&buf->b, (uint16_t)opcode) : opcode;
 
 		key = k_spin_lock(&bt_dev.cmd_lock);
 
@@ -1229,17 +1432,30 @@ static void cmd_ops_dispatch(void)
 			 * up on, meanwhile
 			 */
 			err = -EHOSTDOWN;
-		} else {
-			cmd(buf)->opcode = op->desc->opcode;
+		} else if (opcode > 0) {
+			cmd(buf)->opcode = (uint16_t)opcode;
 			cmd(buf)->op = op;
 			op->state = CMD_OP_BUFFERED;
-			sys_slist_append(&bt_dev.cmd_tx_queue, &buf->node);
+
+			if (cmd_op_seq(op) != NULL) {
+				/* A command of a sequence goes ahead of
+				 * everything that is queued. For the first
+				 * one that is what was queued while it was
+				 * encoded: the queue was empty before.
+				 */
+				cmd_seq_op = op;
+				sys_slist_prepend(&bt_dev.cmd_tx_queue, &buf->node);
+			} else {
+				sys_slist_append(&bt_dev.cmd_tx_queue, &buf->node);
+			}
 
 			/* The deadline may have found nothing to run for */
 			cmd_deadline_start();
+		} else {
+			/* A sequence that has nothing left to send */
 		}
 
-		if (err != 0) {
+		if (err != 0 || opcode == 0) {
 			op->state = CMD_OP_SENT;
 			k_spin_unlock(&bt_dev.cmd_lock, key);
 
@@ -1264,8 +1480,8 @@ bool bt_hci_cmd_op_is_pending(struct bt_hci_cmd_op *op)
 	return pending;
 }
 
-static int cmd_op_submit(struct bt_hci_cmd_op *op, const struct bt_hci_cmd_desc *desc,
-			 uint8_t kind)
+static int cmd_op_submit(struct bt_hci_cmd_op *op, const struct bt_hci_cmd_desc *desc, uint8_t kind,
+			 bool seq)
 {
 	k_spinlock_key_t key;
 
@@ -1287,6 +1503,12 @@ static int cmd_op_submit(struct bt_hci_cmd_op *op, const struct bt_hci_cmd_desc 
 
 	op->desc = desc;
 	op->kind = kind;
+	op->seq = seq ? 1U : 0U;
+	op->step = 0U;
+	/* Now rather than when the controller responds: a sequence that has
+	 * nothing to send must not leave the status of an earlier command.
+	 */
+	op->status = BT_HCI_ERR_SUCCESS;
 
 	if (kind == CMD_OP_KIND_FUTURE) {
 		bt_future_init(cmd_op_fut(op));
@@ -1305,12 +1527,22 @@ static int cmd_op_submit(struct bt_hci_cmd_op *op, const struct bt_hci_cmd_desc 
 
 int bt_hci_cmd_send_cb(struct bt_hci_cmd_op *op, const struct bt_hci_cmd_desc *desc)
 {
-	return cmd_op_submit(op, desc, CMD_OP_KIND_CB);
+	return cmd_op_submit(op, desc, CMD_OP_KIND_CB, false);
 }
 
 int bt_hci_cmd_send_async(struct bt_hci_cmd_op_fut *req, const struct bt_hci_cmd_desc *desc)
 {
-	return cmd_op_submit(&req->op, desc, CMD_OP_KIND_FUTURE);
+	return cmd_op_submit(&req->op, desc, CMD_OP_KIND_FUTURE, false);
+}
+
+int bt_hci_cmd_send_seq_cb(struct bt_hci_cmd_op *op, const struct bt_hci_cmd_seq *seq)
+{
+	return cmd_op_submit(op, &seq->desc, CMD_OP_KIND_CB, true);
+}
+
+int bt_hci_cmd_send_seq_async(struct bt_hci_cmd_op_fut *req, const struct bt_hci_cmd_seq *seq)
+{
+	return cmd_op_submit(&req->op, &seq->desc, CMD_OP_KIND_FUTURE, true);
 }
 
 int bt_hci_cmd_op_cancel(struct bt_hci_cmd_op *op)
@@ -1319,6 +1551,7 @@ int bt_hci_cmd_op_cancel(struct bt_hci_cmd_op *op)
 	struct bt_future *fut = NULL;
 	struct net_buf *buf = NULL;
 	k_spinlock_key_t key;
+	bool wake_tx = false;
 
 	key = k_spin_lock(&bt_dev.cmd_lock);
 
@@ -1366,6 +1599,12 @@ int bt_hci_cmd_op_cancel(struct bt_hci_cmd_op *op)
 
 	op->state = CMD_OP_IDLE;
 
+	if (cmd_seq_op == op) {
+		/* What has waited for the sequence to end can go on */
+		cmd_seq_op = NULL;
+		wake_tx = true;
+	}
+
 	/* Nothing may be left that the deadline is for */
 	if (!cmd_work_pending()) {
 		cmd_deadline_restart();
@@ -1394,15 +1633,55 @@ int bt_hci_cmd_op_cancel(struct bt_hci_cmd_op *op)
 		bt_future_complete(fut, -ECANCELED);
 	}
 
+	if (wake_tx) {
+		bt_tx_irq_raise();
+	}
+
 	return 0;
 }
 #else
 static void cmd_ops_dispatch(void)
 {
 }
+
+static bool cmd_seq_waiting(void)
+{
+	return false;
+}
+
+static bool cmd_seq_lets(const struct net_buf *buf)
+{
+	ARG_UNUSED(buf);
+
+	return true;
+}
+
+static void cmd_op_applied(const struct bt_hci_cmd_op *op)
+{
+	ARG_UNUSED(op);
+}
+
+static int cmd_op_continue(struct bt_hci_cmd_op *op)
+{
+	ARG_UNUSED(op);
+
+	return 1;
+}
 #endif /* CONFIG_BT_CONN */
 
 static bool process_pending_cmd(k_timeout_t timeout);
+
+static bool cmd_seq_is_waiting(void)
+{
+	k_spinlock_key_t key;
+	bool waiting;
+
+	key = k_spin_lock(&bt_dev.cmd_lock);
+	waiting = cmd_seq_waiting();
+	k_spin_unlock(&bt_dev.cmd_lock, key);
+
+	return waiting;
+}
 
 /* A command timed out while Bluetooth is being enabled, and the Controller
  * has not sent anything since the transport was opened: it is missing,
@@ -1554,15 +1833,39 @@ int bt_hci_cmd_send_sync(uint16_t opcode, struct net_buf *buf,
 	    k_current_get() == k_sys_work_q.thread_id) {
 		/* drain the command queue until we get to send the command of interest. */
 		struct net_buf *cmd = NULL;
+		bool sent = false;
+		bool held;
 
 		do {
-			cmd = cmd_tx_queue_peek();
-			LOG_DBG("process cmd %p want %p", cmd, buf);
-
-			/* Wait for the controller to accept the next command.
-			 * The command deadline ends the wait if it never does.
+			/* A sequence that is between two of its commands
+			 * comes before everything in the queue, and the TX
+			 * processor that would give it its buffer runs on
+			 * this thread. Other operations are left alone.
 			 */
-			(void)process_pending_cmd(K_FOREVER);
+			held = cmd_seq_is_waiting();
+			if (held) {
+				bt_dev_lock();
+				cmd_ops_dispatch();
+				bt_dev_unlock();
+
+				held = cmd_seq_is_waiting();
+			}
+
+			if (held) {
+				/* The buffer that it gets is still with the
+				 * driver.
+				 */
+				k_sleep(K_MSEC(1));
+			} else {
+				cmd = cmd_tx_queue_peek();
+				LOG_DBG("process cmd %p want %p", cmd, buf);
+
+				/* Wait for the controller to accept the next
+				 * command. The command deadline ends the wait
+				 * if it never does.
+				 */
+				sent = process_pending_cmd(K_FOREVER);
+			}
 
 			if (!cmd_admission_open()) {
 				/* The transport was closed, or the controller given
@@ -1572,7 +1875,10 @@ int bt_hci_cmd_send_sync(uint16_t opcode, struct net_buf *buf,
 				 */
 				break;
 			}
-		} while (cmd != NULL && buf != cmd);
+			/* The command at the head stays there when a sequence
+			 * has come to wait in front of it in the meantime.
+			 */
+		} while (held || (cmd != NULL && (buf != cmd || !sent)));
 	}
 
 	/* Now that we have sent the command, suspend until the LL replies.
@@ -1618,7 +1924,7 @@ int bt_hci_cmd_send_sync(uint16_t opcode, struct net_buf *buf,
 #if defined(CONFIG_BT_CONN)
 int bt_hci_cmd_op_result(struct bt_hci_cmd_op *op, int result)
 {
-	uint16_t opcode = op->desc->opcode;
+	uint16_t opcode = cmd_op_opcode(op);
 
 	if (cmd_sync_gave_up(opcode, result)) {
 		return -ETIMEDOUT;
@@ -2260,48 +2566,6 @@ void bt_hci_conn_lost(struct bt_conn *conn, uint8_t reason)
 
 	bt_conn_set_state(conn, BT_CONN_DISCONNECT_COMPLETE);
 	hci_conn_disconnected(bt_conn_ref(conn));
-}
-
-int bt_hci_le_read_remote_features(struct bt_conn *conn)
-{
-	struct bt_hci_cp_le_read_remote_features *cp;
-	struct net_buf *buf;
-
-	buf = bt_hci_cmd_alloc(K_FOREVER);
-	if (!buf) {
-		return -ENOBUFS;
-	}
-
-	cp = net_buf_add(buf, sizeof(*cp));
-	cp->handle = sys_cpu_to_le16(conn->handle);
-	/* Results in BT_HCI_EVT_LE_REMOTE_FEAT_COMPLETE */
-	return bt_hci_cmd_send_sync(BT_HCI_OP_LE_READ_REMOTE_FEATURES, buf, NULL);
-}
-
-int bt_hci_read_remote_version(struct bt_conn *conn)
-{
-	struct bt_hci_cp_read_remote_version_info *cp;
-	struct net_buf *buf;
-
-	if (conn->state != BT_CONN_CONNECTED) {
-		return -ENOTCONN;
-	}
-
-	/* Remote version cannot change. */
-	if (atomic_test_bit(conn->flags, BT_CONN_AUTO_VERSION_INFO)) {
-		return 0;
-	}
-
-	buf = bt_hci_cmd_alloc(K_FOREVER);
-	if (!buf) {
-		return -ENOBUFS;
-	}
-
-	cp = net_buf_add(buf, sizeof(*cp));
-	cp->handle = sys_cpu_to_le16(conn->handle);
-
-	return bt_hci_cmd_send_sync(BT_HCI_OP_READ_REMOTE_VERSION_INFO, buf,
-				    NULL);
 }
 
 /* LE Data Length Change Event is optional so this function just ignore
@@ -3819,6 +4083,26 @@ static void hci_cmd_done(uint16_t opcode, uint8_t status, struct net_buf *evt_bu
 		 * operation is handed back below, once the buffer is released
 		 */
 		result = cmd_op_rsp(op, status, evt_buf);
+		if (status == BT_HCI_ERR_SUCCESS) {
+			/* Also when its handler refused the return parameters */
+			cmd_op_applied(op);
+		}
+
+		if (result == 0) {
+			int more = cmd_op_continue(op);
+
+			if (more == 0) {
+				/* A sequence goes on: the buffer that is
+				 * released here is the one that it gets.
+				 */
+				net_buf_unref(buf);
+				bt_tx_irq_raise();
+				return;
+			}
+
+			result = (more < 0) ? more : 0;
+		}
+
 		goto exit;
 	}
 
@@ -4557,14 +4841,18 @@ static bool hci_core_send_cmd(void)
 		return false;
 	}
 
-	/* The queue may have been purged since the caller looked at it */
-	node = cmd_admission_open() ? sys_slist_get(&bt_dev.cmd_tx_queue) : NULL;
-	if (node == NULL) {
+	/* The queue may have been purged since the caller looked at it, and
+	 * a sequence may be on its way that the command at its head is not
+	 * part of.
+	 */
+	node = cmd_admission_open() ? sys_slist_peek_head(&bt_dev.cmd_tx_queue) : NULL;
+	if (node == NULL || !cmd_seq_lets(CONTAINER_OF(node, struct net_buf, node))) {
 		k_spin_unlock(&bt_dev.cmd_lock, key);
 		k_sem_give(&bt_dev.ncmd_sem);
 		return false;
 	}
 
+	(void)sys_slist_get(&bt_dev.cmd_tx_queue);
 	buf = CONTAINER_OF(node, struct net_buf, node);
 
 	/* An operation can only be awaited from here on */
@@ -5219,6 +5507,15 @@ static int le_init(void)
 		if (err) {
 			return err;
 		}
+
+#if defined(CONFIG_BT_AUTO_DATA_LEN_UPDATE)
+		/* For the connections of a controller that does not update
+		 * the data length on its own. bt_dev only has room for them
+		 * with the option.
+		 */
+		bt_dev.le.max_tx_octets = tx_octets;
+		bt_dev.le.max_tx_time = tx_time;
+#endif /* CONFIG_BT_AUTO_DATA_LEN_UPDATE */
 
 		buf = bt_hci_cmd_alloc(K_FOREVER);
 		if (!buf) {
@@ -6639,9 +6936,10 @@ static void tx_processor(struct k_work *item)
 	bt_dev_lock();
 
 	/* The operations get their buffers with the host lock held, which
-	 * their encoders rely on: here and in bt_hci_cmd_op_wait(), but not
-	 * from a synchronous sender that drains the command queue from the
-	 * system workqueue, which does not hold it.
+	 * their encoders rely on: here, in bt_hci_cmd_op_wait() and, for a
+	 * sequence that is between two of its commands, in
+	 * bt_hci_cmd_send_sync(), which otherwise drains the command queue
+	 * from the system workqueue without that lock.
 	 */
 	cmd_ops_dispatch();
 

@@ -27,6 +27,9 @@
 
 #include "hci_cmd_op.h"
 
+/* The first of the BT_CONN_CMD_* flags that stand for a command */
+#define BT_CONN_CMD_FIRST BT_CONN_CMD_DISCONNECT
+
 typedef enum __packed {
 	BT_CONN_DISCONNECTED,         /* Disconnected, conn is completely down */
 	BT_CONN_DISCONNECT_COMPLETE,  /* Received disconn comp event, transition to DISCONNECTED */
@@ -82,7 +85,6 @@ enum {
 	BT_CONN_BR_PAIRING_INITIATOR,         /* local host starts authentication */
 	BT_CONN_CLEANUP,                      /* Disconnected, pending cleanup */
 	BT_CONN_TX_FAILED,                    /* Sending failed, pending disconnect */
-	BT_CONN_AUTO_INIT_PROCEDURES_DONE,    /* Auto-initiated procedures have run */
 	BT_CONN_PERIPHERAL_PARAM_UPDATE,      /* If periph param update timer fired */
 	BT_CONN_PERIPHERAL_PARAM_AUTO_UPDATE, /* If periph param auto update on timer fired */
 	BT_CONN_PERIPHERAL_PARAM_SET,         /* If periph param were set from app */
@@ -100,6 +102,20 @@ enum {
 	BT_CONN_CTE_TX_PARAMS_SET,            /* CTE transmission parameters are set */
 	BT_CONN_CTE_REQ_ENABLED,              /* CTE request procedure is enabled */
 	BT_CONN_CTE_RSP_ENABLED,              /* CTE response procedure is enabled */
+
+	/* The HCI commands that the connection sends through its one command
+	 * operation. A flag is set from when its command is asked for until
+	 * the command takes its parameters, and when several are set, their
+	 * commands are sent in the order that they have here.
+	 */
+	BT_CONN_CMD_DISCONNECT,               /* HCI Disconnect */
+	BT_CONN_CMD_ENCRYPT,                  /* HCI LE Start Encryption */
+	BT_CONN_CMD_REMOTE_FEATURES,          /* HCI LE Read Remote Features */
+	BT_CONN_CMD_REMOTE_VERSION,           /* HCI Read Remote Version Information */
+	BT_CONN_CMD_AUTO_PHY,                 /* HCI LE Set PHY, to the automatic preference */
+	BT_CONN_CMD_AUTO_DATA_LEN,            /* HCI LE Set Data Length, to the maximum */
+	BT_CONN_CMD_CONN_UPDATE,              /* HCI LE Connection Update */
+	BT_CONN_CMD_BUSY,                     /* One of the commands is on its way */
 
 	/* Total number of flags - must be at the end of the enum */
 	BT_CONN_NUM_FLAGS,
@@ -251,7 +267,7 @@ struct bt_conn {
 	/* Connection error or reason for disconnect */
 	uint8_t			err;
 
-	/* Reason that disconnect_op gives the controller */
+	/* Reason that the HCI Disconnect command gives the controller */
 	uint8_t			disconnect_reason;
 
 	bt_conn_state_t state;
@@ -293,11 +309,11 @@ struct bt_conn {
 	 */
 	struct k_work_delayable	deferred_work;
 
-	/* The operation that sends the HCI Disconnect command of this
-	 * connection. While the operation is pending it owns a reference to the
-	 * connection, see conn_hci_send().
+	/* The operation that sends the HCI commands of this connection, one of
+	 * BT_CONN_CMD_* at a time. While the operation is pending it owns a
+	 * reference to the connection, see conn_hci_send().
 	 */
-	struct bt_hci_cmd_op	disconnect_op;
+	struct bt_hci_cmd_op	cmd_op;
 
 	union {
 		struct bt_conn_le	le;
@@ -541,8 +557,18 @@ void bt_conn_br_role_changed(struct bt_conn *conn, uint8_t status);
 
 void bt_conn_br_packet_type_changed(struct bt_conn *conn, uint8_t status, uint16_t packet_type);
 
+/* Send an HCI LE Connection Update command and wait for the response of
+ * the controller, which is returned as by bt_hci_cmd_send_sync(). -ENOTCONN
+ * if the connection is gone.
+ */
 int bt_conn_le_conn_update(struct bt_conn *conn,
 			   const struct bt_le_conn_param *param);
+
+/* The same for an update that the Host starts on its own and that nobody
+ * waits for. The call does not block, of several requests that have not been
+ * sent yet the last one counts, and a refusal of the controller is logged.
+ */
+int bt_conn_le_conn_update_nowait(struct bt_conn *conn, const struct bt_le_conn_param *param);
 
 void bt_conn_notify_remote_info(struct bt_conn *conn);
 
@@ -594,9 +620,15 @@ void bt_conn_notify_cs_procedure_enable_available(struct bt_conn *conn, uint8_t 
 /* If role specific LTK is present */
 bool bt_conn_ltk_present(const struct bt_conn *conn);
 
-/* rand and ediv should be in BT order */
-int bt_conn_le_start_encryption(struct bt_conn *conn, uint8_t rand[8],
-				uint8_t ediv[2], const uint8_t *ltk, size_t len);
+/* Have a central start or refresh the encryption of a connection, with the
+ * key that SMP has put aside for the command, see bt_smp_enc_params().
+ *
+ * A caller that waits gets the response of the controller, as from
+ * bt_hci_cmd_send_sync(), or -ENOTCONN if the connection is gone. Otherwise
+ * the call does not block, and SMP is told of a command that fails
+ * afterwards, see bt_smp_enc_failed().
+ */
+int bt_conn_le_start_encryption(struct bt_conn *conn, bool wait);
 
 /* Notify higher layers that RPA was resolved */
 void bt_conn_identity_resolved(struct bt_conn *conn);
