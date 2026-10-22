@@ -40,6 +40,14 @@
 
 struct test_cmd_script test_cmd;
 struct test_cmd_script test_disconnect;
+struct test_cmd_script test_other;
+uint16_t test_other_opcode;
+uint8_t test_other_params[32];
+uint16_t test_log[16];
+unsigned int test_log_len;
+uint8_t test_le_features[8];
+unsigned int test_acl_count;
+uint8_t test_acl_data[8];
 uint8_t test_cmd_plen[4];
 unsigned int test_reset_count;
 unsigned int test_close_count;
@@ -77,16 +85,17 @@ void test_cmd_respond(const struct test_cmd_script *script)
 {
 	struct net_buf *evt;
 
-	if (script == &test_disconnect) {
+	if (script == &test_disconnect || script == &test_other) {
 		struct bt_hci_evt_cmd_status *status;
 
 		status = evt_create(&evt, BT_HCI_EVT_CMD_STATUS, sizeof(*status));
 		status->status = script->status;
 		status->ncmd = script->ncmd;
-		status->opcode = sys_cpu_to_le16(BT_HCI_OP_DISCONNECT);
+		status->opcode = sys_cpu_to_le16((script == &test_other) ? test_other_opcode
+									  : BT_HCI_OP_DISCONNECT);
 		bt_hci_recv(hci_dev, evt);
 
-		if (script->status == BT_HCI_ERR_SUCCESS) {
+		if (script == &test_disconnect && script->status == BT_HCI_ERR_SUCCESS) {
 			test_disconnect_complete(BT_HCI_ERR_LOCALHOST_TERM_CONN);
 		}
 	} else {
@@ -138,8 +147,16 @@ static void disconnect_rsp_handler(struct k_work *work)
 	test_cmd_respond(&test_disconnect);
 }
 
+static void other_rsp_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	test_cmd_respond(&test_other);
+}
+
 static K_WORK_DELAYABLE_DEFINE(cmd_rsp_work, cmd_rsp_handler);
 static K_WORK_DELAYABLE_DEFINE(disconnect_rsp_work, disconnect_rsp_handler);
+static K_WORK_DELAYABLE_DEFINE(other_rsp_work, other_rsp_handler);
 
 static void scripted(struct test_cmd_script *script, struct k_work_delayable *work)
 {
@@ -152,12 +169,13 @@ static void scripted(struct test_cmd_script *script, struct k_work_delayable *wo
 	}
 }
 
-void test_connect(void)
+const bt_addr_le_t test_peer = {
+	.type = BT_ADDR_LE_RANDOM,
+	.a.val = {0x01U, 0x02U, 0x03U, 0x04U, 0x05U, 0xc6U},
+};
+
+static void connect_as(uint8_t role)
 {
-	const bt_addr_le_t peer = {
-		.type = BT_ADDR_LE_RANDOM,
-		.a.val = {0x01U, 0x02U, 0x03U, 0x04U, 0x05U, 0xc6U},
-	};
 	struct bt_hci_evt_le_conn_complete *cc;
 	struct bt_hci_evt_le_meta_event *meta;
 	struct net_buf *evt;
@@ -168,10 +186,67 @@ void test_connect(void)
 	(void)memset(cc, 0, sizeof(*cc));
 	cc->status = BT_HCI_ERR_SUCCESS;
 	cc->handle = sys_cpu_to_le16(TEST_CONN_HANDLE);
-	cc->role = BT_HCI_ROLE_PERIPHERAL;
-	bt_addr_le_copy(&cc->peer_addr, &peer);
+	cc->role = role;
+	bt_addr_le_copy(&cc->peer_addr, &test_peer);
 	cc->interval = sys_cpu_to_le16(BT_GAP_INIT_CONN_INT_MIN);
 	cc->supv_timeout = sys_cpu_to_le16(BT_GAP_MS_TO_CONN_TIMEOUT(4000U));
+
+	bt_hci_recv(hci_dev, evt);
+}
+
+void test_connect(void)
+{
+	connect_as(BT_HCI_ROLE_PERIPHERAL);
+}
+
+void test_connect_central(void)
+{
+	connect_as(BT_HCI_ROLE_CENTRAL);
+}
+
+void test_encrypt_change(uint8_t status)
+{
+	struct bt_hci_evt_encrypt_change *change;
+	struct net_buf *evt;
+
+	change = evt_create(&evt, BT_HCI_EVT_ENCRYPT_CHANGE, sizeof(*change));
+	change->status = status;
+	change->handle = sys_cpu_to_le16(TEST_CONN_HANDLE);
+	change->encrypt = (status == BT_HCI_ERR_SUCCESS) ? 0x01U : 0x00U;
+
+	bt_hci_recv(hci_dev, evt);
+}
+
+void test_acl_recv(uint16_t cid, const uint8_t *data, uint8_t len)
+{
+	struct bt_hci_acl_hdr *acl;
+	struct net_buf *buf;
+
+	buf = bt_buf_get_rx(BT_BUF_ACL_IN, K_FOREVER);
+	acl = net_buf_add(buf, sizeof(*acl));
+	acl->handle = sys_cpu_to_le16(bt_acl_handle_pack(TEST_CONN_HANDLE, BT_ACL_START));
+	acl->len = sys_cpu_to_le16(4U + len);
+
+	/* The L2CAP header: length and channel */
+	net_buf_add_le16(buf, len);
+	net_buf_add_le16(buf, cid);
+	net_buf_add_mem(buf, data, len);
+
+	bt_hci_recv(hci_dev, buf);
+}
+
+void test_remote_features(const uint8_t features[8])
+{
+	struct bt_hci_evt_le_remote_feat_complete *complete;
+	struct bt_hci_evt_le_meta_event *meta;
+	struct net_buf *evt;
+
+	meta = evt_create(&evt, BT_HCI_EVT_LE_META_EVENT, sizeof(*meta) + sizeof(*complete));
+	meta->subevent = BT_HCI_EVT_LE_REMOTE_FEAT_COMPLETE;
+	complete = (void *)&meta[1];
+	complete->status = BT_HCI_ERR_SUCCESS;
+	complete->handle = sys_cpu_to_le16(TEST_CONN_HANDLE);
+	(void)memcpy(complete->features, features, sizeof(complete->features));
 
 	bt_hci_recv(hci_dev, evt);
 }
@@ -189,6 +264,9 @@ void test_disconnect_complete(uint8_t reason)
 	bt_hci_recv(hci_dev, evt);
 }
 
+/* The command buffer that the controller keeps, see test_cmd_script.keep */
+static struct net_buf *kept_cmd;
+
 static void cmd_handle(struct net_buf *cmd)
 {
 	struct bt_hci_cmd_hdr *chdr;
@@ -198,6 +276,24 @@ static void cmd_handle(struct net_buf *cmd)
 
 	chdr = net_buf_pull_mem(cmd, sizeof(*chdr));
 	opcode = sys_le16_to_cpu(chdr->opcode);
+
+	if (test_log_len < ARRAY_SIZE(test_log)) {
+		test_log[test_log_len] = opcode;
+	}
+
+	test_log_len++;
+
+	if (opcode == test_other_opcode) {
+		(void)memset(test_other_params, 0, sizeof(test_other_params));
+		(void)memcpy(test_other_params, cmd->data,
+			     MIN(cmd->len, sizeof(test_other_params)));
+		if (test_other.keep && kept_cmd == NULL) {
+			kept_cmd = net_buf_ref(cmd);
+		}
+
+		scripted(&test_other, &other_rsp_work);
+		return;
+	}
 
 	switch (opcode) {
 	case TEST_OPCODE:
@@ -210,6 +306,9 @@ static void cmd_handle(struct net_buf *cmd)
 		return;
 	case BT_HCI_OP_DISCONNECT:
 		scripted(&test_disconnect, &disconnect_rsp_work);
+		return;
+	case BT_HCI_OP_HOST_NUM_COMPLETED_PACKETS:
+		/* The one command that a controller does not respond to */
 		return;
 	case BT_HCI_OP_RESET:
 		test_reset_count++;
@@ -247,6 +346,12 @@ static void cmd_handle(struct net_buf *cmd)
 		size->le_max_num = LE_ACL_MAX_NUM;
 		break;
 	}
+	case BT_HCI_OP_LE_READ_LOCAL_FEATURES: {
+		struct bt_hci_rp_le_read_local_features *features = (void *)rp;
+
+		(void)memcpy(features->features, test_le_features, sizeof(features->features));
+		break;
+	}
 	case BT_HCI_OP_LE_READ_SUPP_STATES: {
 		struct bt_hci_rp_le_read_supp_states *states = (void *)rp;
 
@@ -270,6 +375,10 @@ static int send_err(const struct net_buf *buf)
 
 	if (opcode == BT_HCI_OP_DISCONNECT) {
 		return test_disconnect.send_err;
+	}
+
+	if (opcode == test_other_opcode) {
+		return test_other.send_err;
 	}
 
 	return 0;
@@ -307,6 +416,17 @@ static int driver_send(const struct device *dev, struct net_buf *buf)
 		}
 
 		cmd_handle(buf);
+	} else if (buf->data[0] == BT_HCI_H4_ACL) {
+		size_t hdr_len = 1U + sizeof(struct bt_hci_acl_hdr);
+
+		test_acl_count++;
+		(void)memset(test_acl_data, 0, sizeof(test_acl_data));
+		if (buf->len > hdr_len) {
+			(void)memcpy(test_acl_data, &buf->data[hdr_len],
+				     MIN(buf->len - hdr_len, sizeof(test_acl_data)));
+		}
+	} else {
+		/* Nothing else is looked at */
 	}
 
 	net_buf_unref(buf);
@@ -330,9 +450,15 @@ void test_driver_reset(void)
 
 	(void)k_work_cancel_delayable(&cmd_rsp_work);
 	(void)k_work_cancel_delayable(&disconnect_rsp_work);
+	(void)k_work_cancel_delayable(&other_rsp_work);
+	net_buf_drop(&kept_cmd);
 
 	test_cmd = respond_at_once;
 	test_disconnect = respond_at_once;
+	test_other = respond_at_once;
+	test_other_opcode = 0U;
+	test_log_len = 0U;
+	test_acl_count = 0U;
 	test_reset_count = 0U;
 	test_close_count = 0U;
 }
