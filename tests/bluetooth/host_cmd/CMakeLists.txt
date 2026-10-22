@@ -11,6 +11,7 @@ target_sources(app PRIVATE
   src/conn_cmds.c
   src/deadline.c
   src/disconnect.c
+  src/enable.c
   src/op.c
   src/seq.c
 )
