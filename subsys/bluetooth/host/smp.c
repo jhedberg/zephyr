@@ -6508,6 +6508,10 @@ int bt_smp_init(void)
 	LOG_DBG("LE SC %s", sc_supported ? "enabled" : "disabled");
 
 	if (!IS_ENABLED(CONFIG_BT_SMP_OOB_LEGACY_PAIR_ONLY)) {
+		/* The key of a previous bt_enable() is regenerated: until the
+		 * new one is there, it is not to be used.
+		 */
+		sc_public_key = NULL;
 		bt_pub_key_gen(&pub_key_gen.cb);
 	}
 

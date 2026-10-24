@@ -667,6 +667,91 @@ static ZTEST(bt_send_blocks, test_enable_send_blocks)
 
 ZTEST_SUITE(bt_send_blocks, NULL, NULL, NULL, NULL, NULL);
 
+#if defined(CONFIG_BT_OOB_DATA_FIXED) && !defined(CONFIG_BT_LONG_WQ)
+/* Without the long workqueue the public key is generated on the system
+ * workqueue, which this work item keeps busy until it is released.
+ */
+static K_SEM_DEFINE(syswq_release_sem, 0, 1);
+
+static void syswq_block_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	(void)k_sem_take(&syswq_release_sem, K_FOREVER);
+}
+
+static K_WORK_DEFINE(syswq_block_work, syswq_block_handler);
+
+/* Queued behind the key generation, to wait for it */
+static void syswq_marker_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+}
+
+static K_WORK_DEFINE(syswq_marker_work, syswq_marker_handler);
+
+static K_THREAD_STACK_DEFINE(oob_stack, CONFIG_ZTEST_STACK_SIZE + CONFIG_TEST_EXTRA_STACK_SIZE);
+static struct k_thread oob_thread;
+static struct bt_le_oob oob_before_key;
+static int oob_err;
+
+static void oob_entry(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	oob_err = bt_le_oob_get_local(BT_ID_DEFAULT, &oob_before_key);
+}
+
+/* bt_enable() returns before the public key of LE Secure Connections is
+ * generated anew. OOB data asked for in the meantime must be made with the new
+ * key, not with the one from before bt_disable(). With the random number of
+ * the OOB data fixed, its confirm value depends on the key only.
+ */
+static ZTEST(bt_disable, test_oob_data_before_key)
+{
+	struct k_work_sync sync;
+	struct bt_le_oob oob_old;
+	struct bt_le_oob oob_new;
+	int err;
+
+	if (IS_ENABLED(CONFIG_TEST_DRIVER_NO_CLOSE)) {
+		ztest_test_skip();
+	}
+
+	zassert_ok(bt_le_oob_get_local(BT_ID_DEFAULT, &oob_old), "Getting OOB data failed");
+	zassert_ok(bt_disable(), "Bluetooth disable failed");
+
+	zassert_true(k_work_submit(&syswq_block_work) >= 0, "Blocking the system workqueue failed");
+	err = bt_enable(NULL);
+	if (err != 0) {
+		/* Leave the system workqueue to the tests that follow */
+		k_sem_give(&syswq_release_sem);
+	}
+	zassert_ok(err, "Bluetooth init after a disable failed");
+
+	/* Ask for the OOB data while the key is not there */
+	oob_err = -EINPROGRESS;
+	k_thread_create(&oob_thread, oob_stack, K_THREAD_STACK_SIZEOF(oob_stack), oob_entry, NULL,
+			NULL, NULL, K_LOWEST_APPLICATION_THREAD_PRIO, 0, K_NO_WAIT);
+	k_sleep(K_MSEC(10));
+
+	k_sem_give(&syswq_release_sem);
+	zassert_true(k_work_submit(&syswq_marker_work) >= 0, "Queueing the marker failed");
+	(void)k_work_flush(&syswq_marker_work, &sync);
+	zassert_ok(k_thread_join(&oob_thread, K_SECONDS(1)), "Getting OOB data did not return");
+	zassert_ok(oob_err, "Getting OOB data before the key failed (%d)", oob_err);
+
+	zassert_ok(bt_le_oob_get_local(BT_ID_DEFAULT, &oob_new), "Getting OOB data failed");
+	zassert_true(memcmp(oob_old.le_sc_data.c, oob_new.le_sc_data.c,
+			    sizeof(oob_new.le_sc_data.c)) != 0,
+		     "The key is the same after bt_disable()");
+	zassert_mem_equal(oob_before_key.le_sc_data.c, oob_new.le_sc_data.c,
+			  sizeof(oob_new.le_sc_data.c), "OOB data was made with another key");
+}
+#endif /* CONFIG_BT_OOB_DATA_FIXED && !CONFIG_BT_LONG_WQ */
+
 #if defined(CONFIG_BT_PERIPHERAL) && defined(CONFIG_BT_GATT_CLIENT)
 #define TEST_CONN_HANDLE 0x0001U
 
