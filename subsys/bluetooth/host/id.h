@@ -34,6 +34,14 @@ static inline bool bt_id_rpa_is_new(void)
 #endif
 }
 
+/* The stages of bt_enable() for the identities: the first reads those of
+ * the controller, bt_id_init() then sets them up, and the second gives the
+ * controller the random address of a random one.
+ */
+struct bt_hci_cmd_seq;
+extern const struct bt_hci_cmd_seq bt_id_init_seq;
+extern const struct bt_hci_cmd_seq bt_id_init_addr_seq;
+
 int bt_id_init(void);
 
 uint8_t bt_id_read_public_addr(bt_addr_le_t *addr);

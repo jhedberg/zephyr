@@ -66,6 +66,28 @@ extern struct test_cmd_script test_other;
 /** Parameters of the last command with test_other_opcode */
 extern uint8_t test_other_params[32];
 
+/** A command that the controller responds to as it responds to the commands
+ *  that bt_enable() sends, with a Command Complete event, but only once the
+ *  test calls test_held_respond(): for a test that looks at what happens in
+ *  the meantime. test_driver_reset() picks none.
+ */
+extern uint16_t test_held_opcode;
+
+/** Status of the response to test_held_opcode */
+extern uint8_t test_held_status;
+
+/** How often the controller has been given test_held_opcode */
+extern unsigned int test_held_count;
+
+/** Send the response to test_held_opcode now, if the controller holds it */
+void test_held_respond(void);
+
+/** HCI version that the controller reports, 0 after test_driver_reset() */
+extern uint8_t test_hci_version;
+
+/** The controller has no public address, false after test_driver_reset() */
+extern bool test_no_public_addr;
+
 /** The opcodes of the commands that the controller has been given, in order,
  *  since the last test_driver_reset() or since a test set the length to zero.
  */

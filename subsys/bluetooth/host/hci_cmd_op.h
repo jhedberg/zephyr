@@ -53,9 +53,10 @@ typedef int (*bt_hci_cmd_encode_t)(struct net_buf *buf, struct bt_hci_cmd_op *op
 
 /** @brief Handler of the return parameters of an asynchronous HCI command.
  *
- *  Called when the controller has responded to the command with success,
- *  before the command buffer is released and the completion is handed back,
- *  with the return parameters of the Command Complete event, the status first.
+ *  Called when the controller has responded to the command with success, or
+ *  has refused the command of a step with BT_HCI_CMD_STEP_OPTIONAL, before
+ *  the command buffer is released and the completion is handed back, with
+ *  the return parameters of the Command Complete event, the status first.
  *  bt_hci_cmd_op_status() gives the status already.
  *
  *  Runs where the response arrives: in the receive context of the HCI driver,
@@ -156,6 +157,17 @@ struct bt_hci_cmd_op {
  */
 #define BT_HCI_CMD_SKIP 1
 
+/** @brief Flag of a step whose command may fail.
+ *
+ *  When the controller refuses the command of the step, the handler of the
+ *  step is told, with the status in bt_hci_cmd_op_status() and the return
+ *  parameters that came with the refusal, and unless it ends the sequence,
+ *  the sequence goes on with the next step as after a success: the refusal
+ *  is not what the sequence completes with. For a command that the controller need not support. A
+ *  failure of another kind, such as a timeout, still ends the sequence.
+ */
+#define BT_HCI_CMD_STEP_OPTIONAL BIT(0)
+
 /** @brief One command of a sequence, see struct bt_hci_cmd_seq. */
 struct bt_hci_cmd_step {
 	/** Command OpCode */
@@ -178,6 +190,8 @@ struct bt_hci_cmd_step {
 	 *  the sequence, see bt_hci_cmd_rsp_t.
 	 */
 	bt_hci_cmd_rsp_t rsp;
+	/** BT_HCI_CMD_STEP_OPTIONAL, or 0 */
+	uint8_t flags;
 };
 
 /** @brief Description of a sequence of HCI commands.
