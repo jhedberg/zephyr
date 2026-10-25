@@ -135,8 +135,7 @@ static struct bt_conn_tx conn_tx[CONFIG_BT_BUF_ACL_TX_COUNT];
 static struct bt_conn sco_conns[CONFIG_BT_MAX_SCO_CONN];
 #endif /* CONFIG_BT_CLASSIC */
 
-/* The HCI Disconnect operation of a connection, conn->disconnect_op, and its
- * reference.
+/* The HCI command operation of a connection, conn->cmd_op, and its reference.
  *
  * The completion of the operation gets to the connection through the
  * operation, which is a member of it, so a pending operation owns a reference
@@ -162,7 +161,7 @@ static int conn_hci_send(struct bt_conn *conn, const struct bt_hci_cmd_desc *des
 
 	__ASSERT_NO_MSG(ref != NULL);
 
-	err = bt_hci_cmd_send_cb(&conn->disconnect_op, desc);
+	err = bt_hci_cmd_send_cb(&conn->cmd_op, desc);
 	if (err != 0) {
 		/* Not pending, so nothing owns the reference */
 		bt_conn_unref(ref);
@@ -174,13 +173,20 @@ static int conn_hci_send(struct bt_conn *conn, const struct bt_hci_cmd_desc *des
 /* Take back the command of the connection if it has not been sent yet. Its
  * completion function is not called then, and the reference of the operation
  * is released here. The connection is borrowed from the caller, so that is
- * not the last one. A command that has been sent completes on its own.
+ * not the last one.
+ *
+ * Returns true if a command was taken back. One that has been sent completes
+ * on its own.
  */
-static void conn_hci_cancel(struct bt_conn *conn)
+static bool conn_hci_cancel(struct bt_conn *conn)
 {
-	if (bt_hci_cmd_op_cancel(&conn->disconnect_op) == 0) {
-		bt_conn_unref(conn);
+	if (bt_hci_cmd_op_cancel(&conn->cmd_op) != 0) {
+		return false;
 	}
+
+	bt_conn_unref(conn);
+
+	return true;
 }
 
 /* The connection of an operation that has completed, for the completion
@@ -189,7 +195,29 @@ static void conn_hci_cancel(struct bt_conn *conn)
  */
 static struct bt_conn *conn_hci_take(struct bt_hci_cmd_op *op)
 {
-	return CONTAINER_OF(op, struct bt_conn, disconnect_op);
+	return CONTAINER_OF(op, struct bt_conn, cmd_op);
+}
+
+/* Forget the commands of the connection that wait for their turn, see
+ * conn_cmd_request().
+ */
+static void conn_cmds_clear(struct bt_conn *conn)
+{
+	for (int flag = BT_CONN_CMD_FIRST; flag < BT_CONN_CMD_BUSY; flag++) {
+		atomic_clear_bit(conn->flags, flag);
+	}
+}
+
+/* The connection is gone: what it still had to send has nothing left to do.
+ * A command that is with the controller completes on its own.
+ */
+static void conn_cmds_cancel(struct bt_conn *conn)
+{
+	conn_cmds_clear(conn);
+
+	if (conn_hci_cancel(conn)) {
+		atomic_clear_bit(conn->flags, BT_CONN_CMD_BUSY);
+	}
 }
 #endif /* CONFIG_BT_CONN */
 
@@ -1419,10 +1447,7 @@ void bt_conn_set_state(struct bt_conn *conn, bt_conn_state_t state)
 		 */
 		atomic_clear_bit(conn->flags, BT_CONN_TX_FAILED);
 #if defined(CONFIG_BT_CONN)
-		/* A disconnect request that has not been sent yet has nothing
-		 * left to do.
-		 */
-		conn_hci_cancel(conn);
+		conn_cmds_cancel(conn);
 
 		if (bt_conn_is_sco(conn)) {
 			if (IS_ENABLED(CONFIG_BT_CLASSIC)) {
@@ -1942,23 +1967,468 @@ int bt_conn_disconnect(struct bt_conn *conn, uint8_t reason)
 #define AUTO_PHY_CENTRAL_SUPPORTED(_feat) (false)
 #endif
 
+/* Change the state only if it still is what the caller found. Disconnection
+ * Complete is handled in the priority receive path, which can run between a
+ * check and a write of the state, or on another CPU, and takes the connection
+ * to BT_CONN_DISCONNECT_COMPLETE. bt_conn_set_state() writes the state with
+ * the same lock held.
+ */
+static bool conn_state_swap(struct bt_conn *conn, bt_conn_state_t from, bt_conn_state_t to)
+{
+	unsigned int key;
+	bool swapped;
+
+	key = irq_lock();
+
+	swapped = (conn->state == from);
+	if (swapped) {
+		conn->state = to;
+	}
+
+	irq_unlock(key);
+
+	if (swapped) {
+		LOG_DBG("%s -> %s", state2str(from), state2str(to));
+	}
+
+	return swapped;
+}
+
+/* One of the HCI commands that a connection sends through its command
+ * operation, BT_CONN_CMD_*. Its functions get the connection where those of a
+ * command description get the operation.
+ */
+struct conn_cmd {
+	struct bt_hci_cmd_desc desc;
+	/* Adds the parameters, or refuses a command that is no longer wanted
+	 * with a negative value, under the conditions of bt_hci_cmd_encode_t.
+	 */
+	int (*encode)(struct bt_conn *conn, struct net_buf *buf);
+	/* Is told the result on the Bluetooth workqueue. Without it a failure
+	 * is logged.
+	 */
+	void (*done)(struct bt_conn *conn, int result);
+};
+
+/* The two functions of every description in conn_cmds[]. They need the table
+ * themselves, hence the declarations.
+ */
+static int conn_cmd_encode(struct net_buf *buf, struct bt_hci_cmd_op *op);
+static void conn_cmd_done(struct bt_hci_cmd_op *op, int result);
+
+#define CONN_CMD(_opcode, _encode, _done)                                                          \
+	{                                                                                          \
+		.desc = {                                                                          \
+			.opcode = (_opcode),                                                       \
+			.encode = conn_cmd_encode,                                                 \
+			.done = conn_cmd_done,                                                     \
+		},                                                                                 \
+		.encode = (_encode),                                                               \
+		.done = (_done),                                                                   \
+	}
+
+static int disconnect_encode(struct bt_conn *conn, struct net_buf *buf)
+{
+	struct bt_hci_cp_disconnect *cp;
+
+	/* The connection may have gone away, or back to connected, since the
+	 * request was made.
+	 */
+	if (conn->state != BT_CONN_DISCONNECTING) {
+		return -ENOTCONN;
+	}
+
+	cp = net_buf_add(buf, sizeof(*cp));
+	cp->handle = sys_cpu_to_le16(conn->handle);
+	cp->reason = conn->disconnect_reason;
+
+	return 0;
+}
+
+/* The outcome of the HCI Disconnect command. A success needs nothing: the
+ * Disconnection Complete event follows.
+ */
+static void disconnect_done(struct bt_conn *conn, int result)
+{
+	if (result == BT_HCI_ERR_UNKNOWN_CONN_ID) {
+		/* The controller has lost the connection without a word, as
+		 * the event would have taken it out of this state. There is no
+		 * reason to report other than what was found.
+		 */
+		if (conn->state == BT_CONN_DISCONNECTING) {
+			LOG_WRN("conn %p is unknown to the controller", conn);
+			bt_hci_conn_lost(conn, BT_HCI_ERR_UNKNOWN_CONN_ID);
+		}
+	} else if (result > 0 || result == -EIO || result == -ENOBUFS) {
+		/* Rejected by the controller, or never sent to it: the link
+		 * is still up, unless a disconnection has overtaken the
+		 * request. Only the state is put back, as entering
+		 * BT_CONN_CONNECTED sets the connection up anew, and nobody
+		 * is told, as nothing has changed for them.
+		 */
+		if (conn_state_swap(conn, BT_CONN_DISCONNECTING, BT_CONN_CONNECTED)) {
+			LOG_WRN("Unable to disconnect %p (%d)", conn, result);
+
+			/* Let it go on sending, also when it was a failure to
+			 * send that it was to be disconnected for. The TX
+			 * processor has taken it off its list while it was
+			 * not connected.
+			 */
+			atomic_clear_bit(conn->flags, BT_CONN_TX_FAILED);
+			bt_conn_data_ready(conn);
+		}
+	} else {
+		/* Accepted, or the Host is going down or has given up on the
+		 * controller, either of which takes care of the connection.
+		 */
+	}
+}
+
+/* The parameters of a command that only names its connection, which has to
+ * be up.
+ */
+static int conn_handle_encode(struct bt_conn *conn, struct net_buf *buf)
+{
+	if (conn->state != BT_CONN_CONNECTED) {
+		return -ENOTCONN;
+	}
+
+	net_buf_add_le16(buf, conn->handle);
+
+	return 0;
+}
+
+/* LE Start Encryption is a command of a central with SMP. Its functions call
+ * into SMP, and nothing refers to them in another build.
+ */
+#define CONN_CMD_ENCRYPT_ENABLED (IS_ENABLED(CONFIG_BT_SMP) && IS_ENABLED(CONFIG_BT_CENTRAL))
+
+static int encrypt_encode(struct bt_conn *conn, struct net_buf *buf)
+{
+	struct bt_hci_cp_le_start_encryption *cp;
+
+	if (conn->state != BT_CONN_CONNECTED) {
+		return -ENOTCONN;
+	}
+
+	cp = net_buf_add(buf, sizeof(*cp));
+	(void)memset(cp, 0, sizeof(*cp));
+	cp->handle = sys_cpu_to_le16(conn->handle);
+
+	/* SMP has put the key aside */
+	return bt_smp_enc_params(conn, cp);
+}
+
+/* The outcome of an HCI LE Start Encryption command that nobody waits for.
+ * A success needs nothing: the Encryption Change event follows. A refusal of
+ * the encoder means that encryption is no longer wanted, and a closed HCI
+ * transport or a controller that is given up on ends more than this command,
+ * see conn_cmd_request().
+ */
+static void encrypt_done(struct bt_conn *conn, int result)
+{
+	if (result == 0 || result == -ECANCELED || result == -EHOSTDOWN || result == -ETIMEDOUT) {
+		return;
+	}
+
+	LOG_ERR("Failed to start encryption of %p (%d)", conn, result);
+
+	/* No event follows: SMP is told, as by the return value of a
+	 * synchronous command.
+	 */
+	bt_smp_enc_failed(conn);
+}
+
+static int auto_phy_encode(struct bt_conn *conn, struct net_buf *buf)
+{
+	uint8_t pref = (conn->role == BT_HCI_ROLE_CENTRAL) ? AUTO_PHY_CENTRAL_PREF
+							   : AUTO_PHY_PERIPHERAL_PREF;
+	struct bt_hci_cp_le_set_phy *cp;
+
+	if (conn->state != BT_CONN_CONNECTED) {
+		return -ENOTCONN;
+	}
+
+	cp = net_buf_add(buf, sizeof(*cp));
+	cp->handle = sys_cpu_to_le16(conn->handle);
+	cp->all_phys = 0U;
+	cp->tx_phys = pref;
+	cp->rx_phys = pref;
+	cp->phy_opts = sys_cpu_to_le16(BT_HCI_LE_PHY_CODED_ANY);
+
+	return 0;
+}
+
+#if defined(CONFIG_BT_AUTO_DATA_LEN_UPDATE)
+static int auto_data_len_encode(struct bt_conn *conn, struct net_buf *buf)
+{
+	struct bt_hci_cp_le_set_data_len *cp;
+
+	if (conn->state != BT_CONN_CONNECTED) {
+		return -ENOTCONN;
+	}
+
+	cp = net_buf_add(buf, sizeof(*cp));
+	cp->handle = sys_cpu_to_le16(conn->handle);
+	cp->tx_octets = sys_cpu_to_le16(bt_dev.le.max_tx_octets);
+	cp->tx_time = sys_cpu_to_le16(bt_dev.le.max_tx_time);
+
+	return 0;
+}
+#else
+/* bt_dev only keeps the maximum data length with the option */
+#define auto_data_len_encode NULL
+#endif /* CONFIG_BT_AUTO_DATA_LEN_UPDATE */
+
+/* Add the parameters of an HCI LE Connection Update command */
+static int conn_update_add(struct bt_conn *conn, struct net_buf *buf,
+			   const struct bt_le_conn_param *param)
+{
+	struct hci_cp_le_conn_update *cp;
+
+	if (conn->state != BT_CONN_CONNECTED) {
+		return -ENOTCONN;
+	}
+
+	cp = net_buf_add(buf, sizeof(*cp));
+	(void)memset(cp, 0, sizeof(*cp));
+	cp->handle = sys_cpu_to_le16(conn->handle);
+	cp->conn_interval_min = sys_cpu_to_le16(param->interval_min);
+	cp->conn_interval_max = sys_cpu_to_le16(param->interval_max);
+	cp->conn_latency = sys_cpu_to_le16(param->latency);
+	cp->supervision_timeout = sys_cpu_to_le16(param->timeout);
+
+	return 0;
+}
+
+/* An update that the Host starts on its own takes the parameters that the
+ * connection keeps, see bt_conn_le_conn_update_nowait().
+ */
+static int conn_update_encode(struct bt_conn *conn, struct net_buf *buf)
+{
+	const struct bt_le_conn_param param = {
+		.interval_min = conn->le.interval_min,
+		.interval_max = conn->le.interval_max,
+		.latency = conn->le.pending_latency,
+		.timeout = conn->le.pending_timeout,
+	};
+
+	return conn_update_add(conn, buf, &param);
+}
+
+/* The outcome of such an update. A success needs nothing: the LE Connection
+ * Update Complete event follows.
+ */
+static void conn_update_done(struct bt_conn *conn, int result)
+{
+	if (result == 0 || result == -ECANCELED) {
+		return;
+	}
+
+	/* No update is under way, and nobody waits for one */
+	LOG_WRN("Unable to update the parameters of %p (%d)", conn, result);
+	atomic_clear_bit(conn->flags, BT_CONN_PERIPHERAL_PARAM_AUTO_UPDATE);
+}
+
+/* The commands of a connection, by their flags. One that is not part of the
+ * build has no functions here, and nothing else refers to them either.
+ */
+static const struct conn_cmd conn_cmds[] = {
+	[BT_CONN_CMD_DISCONNECT - BT_CONN_CMD_FIRST] =
+		CONN_CMD(BT_HCI_OP_DISCONNECT, disconnect_encode, disconnect_done),
+	[BT_CONN_CMD_ENCRYPT - BT_CONN_CMD_FIRST] =
+		CONN_CMD(BT_HCI_OP_LE_START_ENCRYPTION,
+			 CONN_CMD_ENCRYPT_ENABLED ? encrypt_encode : NULL,
+			 CONN_CMD_ENCRYPT_ENABLED ? encrypt_done : NULL),
+	/* Results in an LE Read Remote Features Complete event */
+	[BT_CONN_CMD_REMOTE_FEATURES - BT_CONN_CMD_FIRST] =
+		CONN_CMD(BT_HCI_OP_LE_READ_REMOTE_FEATURES, conn_handle_encode, NULL),
+	[BT_CONN_CMD_REMOTE_VERSION - BT_CONN_CMD_FIRST] =
+		CONN_CMD(BT_HCI_OP_READ_REMOTE_VERSION_INFO, conn_handle_encode, NULL),
+	[BT_CONN_CMD_AUTO_PHY - BT_CONN_CMD_FIRST] =
+		CONN_CMD(BT_HCI_OP_LE_SET_PHY,
+			 IS_ENABLED(CONFIG_BT_PHY_UPDATE) ? auto_phy_encode : NULL, NULL),
+	[BT_CONN_CMD_AUTO_DATA_LEN - BT_CONN_CMD_FIRST] =
+		CONN_CMD(BT_HCI_OP_LE_SET_DATA_LEN, auto_data_len_encode, NULL),
+	[BT_CONN_CMD_CONN_UPDATE - BT_CONN_CMD_FIRST] =
+		CONN_CMD(BT_HCI_OP_LE_CONN_UPDATE, conn_update_encode, conn_update_done),
+};
+
+BUILD_ASSERT(ARRAY_SIZE(conn_cmds) == BT_CONN_CMD_BUSY - BT_CONN_CMD_FIRST,
+	     "Every BT_CONN_CMD_* flag of a command needs its entry");
+
+static const struct conn_cmd *conn_cmd_of(const struct bt_hci_cmd_op *op)
+{
+	return CONTAINER_OF(bt_hci_cmd_op_desc(op), struct conn_cmd, desc);
+}
+
+static int conn_cmd_encode(struct net_buf *buf, struct bt_hci_cmd_op *op)
+{
+	/* The operation is pending, and its reference keeps the connection */
+	struct bt_conn *conn = CONTAINER_OF(op, struct bt_conn, cmd_op);
+	const struct conn_cmd *cmd = conn_cmd_of(op);
+
+	/* The command takes its parameters now: what is asked for from here
+	 * on is another command.
+	 */
+	atomic_clear_bit(conn->flags, BT_CONN_CMD_FIRST + (int)(cmd - conn_cmds));
+
+	return cmd->encode(conn, buf);
+}
+
+/* A disconnect request has taken the connection to BT_CONN_DISCONNECTING.
+ * Every other command is for a connection that is up, and waits while it is
+ * not: a disconnect that the controller rejects leaves it up.
+ */
+static bool conn_cmd_eligible(const struct bt_conn *conn, int flag)
+{
+	return conn->state ==
+	       ((flag == BT_CONN_CMD_DISCONNECT) ? BT_CONN_DISCONNECTING : BT_CONN_CONNECTED);
+}
+
+/* The first of the requested commands that the connection can send now */
+static int conn_cmd_next(const struct bt_conn *conn)
+{
+	for (int flag = BT_CONN_CMD_FIRST; flag < BT_CONN_CMD_BUSY; flag++) {
+		if (atomic_test_bit(conn->flags, flag) && conn_cmd_eligible(conn, flag)) {
+			return flag;
+		}
+	}
+
+	return -ENOENT;
+}
+
+/* Send the next of the commands that the connection has been asked for,
+ * unless one is on its way, the completion of which gets here again. The
+ * connection is borrowed from the caller.
+ */
+static int conn_cmd_send_next(struct bt_conn *conn)
+{
+	int err = 0;
+
+	do {
+		int flag;
+
+		if (atomic_test_and_set_bit(conn->flags, BT_CONN_CMD_BUSY)) {
+			return 0;
+		}
+
+		flag = conn_cmd_next(conn);
+		if (flag >= 0) {
+			err = conn_hci_send(conn, &conn_cmds[flag - BT_CONN_CMD_FIRST].desc);
+			if (err == 0) {
+				return 0;
+			}
+		}
+
+		atomic_clear_bit(conn->flags, BT_CONN_CMD_BUSY);
+
+		/* A request that found the flag set in the meantime has left
+		 * its command to this call.
+		 */
+	} while (err == 0 && conn_cmd_next(conn) >= 0);
+
+	return err;
+}
+
+static void conn_cmd_done(struct bt_hci_cmd_op *op, int result)
+{
+	const struct conn_cmd *cmd = conn_cmd_of(op);
+	/* With the reference of the operation, which is released below */
+	struct bt_conn *conn = conn_hci_take(op);
+
+	/* A controller that has stopped responding is met as by a synchronous
+	 * sender. A stale request and a status of the controller are looked at
+	 * as they are.
+	 */
+	if (result < 0 && result != -ECANCELED) {
+		result = bt_hci_cmd_op_result(op, result);
+	}
+
+	if (cmd->done != NULL) {
+		cmd->done(conn, result);
+	} else if (result > 0) {
+		LOG_WRN("opcode 0x%04x failed for %p (%d)", cmd->desc.opcode, conn, result);
+	} else {
+		/* Sent, no longer wanted, or failed and logged */
+	}
+
+	/* The operation is free for the next command of the connection,
+	 * which gets a reference of its own.
+	 */
+	atomic_clear_bit(conn->flags, BT_CONN_CMD_BUSY);
+	if (conn_cmd_send_next(conn) != 0) {
+		/* Nothing is sent any more, see conn_cmd_request() */
+		conn_cmds_clear(conn);
+	}
+
+	/* May be the last reference */
+	bt_conn_unref(conn);
+}
+
+/* Have the connection send one of its commands, BT_CONN_CMD_*. It is sent
+ * when the commands that the connection was asked for before, and those that
+ * come before it in the order of the flags, have got their responses. Its
+ * parameters are taken from the connection when it is sent, so a command that
+ * is requested again before that is sent once. Neither blocks nor allocates.
+ *
+ * Returns 0 once the command has been sent or waits for its turn, -ENOTCONN
+ * if the connection is not in the state for it, and -EHOSTDOWN if the HCI
+ * transport is closed, in which case nothing is sent.
+ *
+ * A command that still waits for its turn when the HCI transport is closed,
+ * or when the controller is given up on, is dropped without its done function
+ * being called: bt_disable() is what follows, and the connection goes with it.
+ */
+static int conn_cmd_request(struct bt_conn *conn, int flag)
+{
+	int err;
+
+	__ASSERT(conn_cmds[flag - BT_CONN_CMD_FIRST].encode != NULL,
+		 "Command %d of a connection is not part of this build", flag);
+
+	if (!conn_cmd_eligible(conn, flag)) {
+		return -ENOTCONN;
+	}
+
+	atomic_set_bit(conn->flags, flag);
+
+	err = conn_cmd_send_next(conn);
+	if (err != 0) {
+		atomic_clear_bit(conn->flags, flag);
+	}
+
+	return err;
+}
+
+/* Wait for a command that was sent for a connection from the stack of the
+ * caller, and return what a synchronous command returns.
+ */
+static int conn_req_wait(struct bt_hci_cmd_op_fut *req)
+{
+	int err = bt_hci_cmd_op_wait(&req->op);
+
+	/* Refused by its encoder: the connection is gone, and what the
+	 * command was for with it.
+	 */
+	return (err == -ECANCELED) ? -ENOTCONN : err;
+}
+
 static int do_phy_update(struct bt_conn *conn)
 {
-	uint8_t phy, pref;
+	uint8_t phy;
 	bool supported;
 
 	switch (conn->role) {
 #if !defined(CONFIG_BT_AUTO_PHY_CENTRAL_NONE)
 	case BT_HCI_ROLE_CENTRAL:
 		phy = AUTO_PHY_CENTRAL;
-		pref = AUTO_PHY_CENTRAL_PREF;
 		supported = AUTO_PHY_CENTRAL_SUPPORTED(bt_dev.le.features);
 		break;
 #endif
 #if !defined(CONFIG_BT_AUTO_PHY_PERIPHERAL_NONE)
 	case BT_HCI_ROLE_PERIPHERAL:
 		phy = AUTO_PHY_PERIPHERAL;
-		pref = AUTO_PHY_PERIPHERAL_PREF;
 		supported = AUTO_PHY_PERIPHERAL_SUPPORTED(bt_dev.le.features);
 		break;
 #endif
@@ -1982,7 +2452,7 @@ static int do_phy_update(struct bt_conn *conn)
 	}
 #endif
 
-	return bt_le_set_phy(conn, 0U, pref, pref, BT_HCI_LE_PHY_CODED_ANY);
+	return conn_cmd_request(conn, BT_CONN_CMD_AUTO_PHY);
 }
 
 static bool can_initiate_feature_exchange(struct bt_conn *conn)
@@ -2006,46 +2476,35 @@ static bool can_initiate_feature_exchange(struct bt_conn *conn)
 	return BT_FEAT_LE_PER_INIT_FEAT_XCHG(bt_dev.le.features);
 }
 
-static void perform_auto_initiated_procedures(struct bt_conn *conn, void *unused)
+/* Starts the procedures that follow the establishment of a connection:
+ * - read remote features
+ * - read remote version
+ * - update PHY
+ * - update data length
+ *
+ * Their commands are sent one after the other through the command operation
+ * of the connection, which blocks nothing: there is no need to leave this to
+ * a work item. A command that the controller refuses is logged.
+ */
+static void auto_initiated_procedures(struct bt_conn *conn)
 {
 	int err;
 
-	ARG_UNUSED(unused);
-
 	LOG_DBG("[%p] Running auto-initiated procedures", conn);
-
-	if (conn->state != BT_CONN_CONNECTED) {
-		/* It is possible that connection was disconnected directly from
-		 * connected callback so we must check state before doing
-		 * connection parameters update.
-		 */
-		return;
-	}
-
-	if (atomic_test_and_set_bit(conn->flags, BT_CONN_AUTO_INIT_PROCEDURES_DONE)) {
-		/* We have already run the auto-initiated procedures */
-		return;
-	}
 
 	if (!atomic_test_bit(conn->flags, BT_CONN_LE_FEATURES_EXCHANGED) &&
 	    can_initiate_feature_exchange(conn)) {
-		err = bt_hci_le_read_remote_features(conn);
-		if (err) {
-			LOG_ERR("Failed read remote features (%d)", err);
-		}
-		if (conn->state != BT_CONN_CONNECTED) {
-			return;
+		err = conn_cmd_request(conn, BT_CONN_CMD_REMOTE_FEATURES);
+		if (err != 0) {
+			goto refused;
 		}
 	}
 
 	if (IS_ENABLED(CONFIG_BT_REMOTE_VERSION) &&
 	    !atomic_test_bit(conn->flags, BT_CONN_AUTO_VERSION_INFO)) {
-		err = bt_hci_read_remote_version(conn);
-		if (err) {
-			LOG_ERR("Failed read remote version (%d)", err);
-		}
-		if (conn->state != BT_CONN_CONNECTED) {
-			return;
+		err = conn_cmd_request(conn, BT_CONN_CMD_REMOTE_VERSION);
+		if (err != 0) {
+			goto refused;
 		}
 	}
 
@@ -2053,12 +2512,8 @@ static void perform_auto_initiated_procedures(struct bt_conn *conn, void *unused
 	    (!IS_ENABLED(CONFIG_BT_AUTO_PHY_CENTRAL_NONE) ||
 	     !IS_ENABLED(CONFIG_BT_AUTO_PHY_PERIPHERAL_NONE))) {
 		err = do_phy_update(conn);
-		if (err) {
-			LOG_ERR("Failed LE Set PHY (%d)", err);
-		}
-
-		if (conn->state != BT_CONN_CONNECTED) {
-			return;
+		if (err != 0) {
+			goto refused;
 		}
 	}
 
@@ -2067,46 +2522,32 @@ static void perform_auto_initiated_procedures(struct bt_conn *conn, void *unused
 	 */
 	if (IS_ENABLED(CONFIG_BT_AUTO_DATA_LEN_UPDATE) && BT_FEAT_LE_DLE(bt_dev.le.features) &&
 	    bt_drv_quirk_no_auto_dle()) {
-		uint16_t tx_octets, tx_time;
-
-		err = bt_hci_le_read_max_data_len(&tx_octets, &tx_time);
-		if (!err) {
-			err = bt_le_set_data_len(conn, tx_octets, tx_time);
-			if (err) {
-				LOG_ERR("Failed to set data len (%d)", err);
-			}
+		err = conn_cmd_request(conn, BT_CONN_CMD_AUTO_DATA_LEN);
+		if (err != 0) {
+			goto refused;
 		}
 	}
 
-	LOG_DBG("[%p] Successfully ran auto-initiated procedures", conn);
-}
+	return;
 
-/* Executes procedures after a connection is established:
- * - read remote features
- * - read remote version
- * - update PHY
- * - update data length
- */
-static void auto_initiated_procedures(struct k_work *unused)
-{
-	ARG_UNUSED(unused);
-
-	bt_conn_foreach(BT_CONN_TYPE_LE, perform_auto_initiated_procedures, NULL);
-}
-
-static K_WORK_DEFINE(procedures_on_connect, auto_initiated_procedures);
-
-static void schedule_auto_initiated_procedures(struct bt_conn *conn)
-{
-	LOG_DBG("[%p] Scheduling auto-init procedures", conn);
-	bt_work_submit(&procedures_on_connect);
+refused:
+	/* The commands after a refused one would be refused as well. A
+	 * connection that is no longer up is not worth a word: a connected
+	 * callback may have disconnected it. Anything else is.
+	 */
+	if (err != -ENOTCONN) {
+		LOG_WRN("[%p] Auto-initiated procedures stopped (%d)", conn, err);
+	}
 }
 
 void bt_conn_connected(struct bt_conn *conn)
 {
-	schedule_auto_initiated_procedures(conn);
 	bt_l2cap_connected(conn);
 	notify_connected(conn);
+
+	if (bt_conn_is_le(conn)) {
+		auto_initiated_procedures(conn);
+	}
 }
 
 #if defined(CONFIG_BT_CLASSIC)
@@ -2157,112 +2598,6 @@ static bool disconnect_reason_valid(uint8_t reason)
 	}
 }
 
-/* Change the state only if it still is what the caller found. Disconnection
- * Complete is handled in the priority receive path, which can run between a
- * check and a write of the state, or on another CPU, and takes the connection
- * to BT_CONN_DISCONNECT_COMPLETE. bt_conn_set_state() writes the state with
- * the same lock held.
- */
-static bool conn_state_swap(struct bt_conn *conn, bt_conn_state_t from, bt_conn_state_t to)
-{
-	unsigned int key;
-	bool swapped;
-
-	key = irq_lock();
-
-	swapped = (conn->state == from);
-	if (swapped) {
-		conn->state = to;
-	}
-
-	irq_unlock(key);
-
-	if (swapped) {
-		LOG_DBG("%s -> %s", state2str(from), state2str(to));
-	}
-
-	return swapped;
-}
-
-static int disconnect_encode(struct net_buf *buf, struct bt_hci_cmd_op *op)
-{
-	/* The operation is pending, and its reference keeps the connection */
-	struct bt_conn *conn = CONTAINER_OF(op, struct bt_conn, disconnect_op);
-	struct bt_hci_cp_disconnect *cp;
-
-	/* The connection may have gone away, or back to connected, since the
-	 * request was queued.
-	 */
-	if (conn->state != BT_CONN_DISCONNECTING) {
-		return -ENOTCONN;
-	}
-
-	cp = net_buf_add(buf, sizeof(*cp));
-	cp->handle = sys_cpu_to_le16(conn->handle);
-	cp->reason = conn->disconnect_reason;
-
-	return 0;
-}
-
-/* The outcome of the HCI Disconnect command. A success needs nothing: the
- * Disconnection Complete event follows.
- */
-static void disconnect_done(struct bt_hci_cmd_op *op, int result)
-{
-	/* With the reference of the operation, which is released below */
-	struct bt_conn *conn = conn_hci_take(op);
-
-	/* A controller that has stopped responding is met as by a synchronous
-	 * Disconnect. A stale request and a status of the controller are
-	 * looked at as they are.
-	 */
-	if (result < 0 && result != -ECANCELED) {
-		result = bt_hci_cmd_op_result(op, result);
-	}
-
-	if (result == BT_HCI_ERR_UNKNOWN_CONN_ID) {
-		/* The controller has lost the connection without a word, as
-		 * the event would have taken it out of this state. There is no
-		 * reason to report other than what was found.
-		 */
-		if (conn->state == BT_CONN_DISCONNECTING) {
-			LOG_WRN("conn %p is unknown to the controller", conn);
-			bt_hci_conn_lost(conn, BT_HCI_ERR_UNKNOWN_CONN_ID);
-		}
-	} else if (result > 0 || result == -EIO || result == -ENOBUFS) {
-		/* Rejected by the controller, or never sent to it: the link
-		 * is still up, unless a disconnection has overtaken the
-		 * request. Only the state is put back, as entering
-		 * BT_CONN_CONNECTED sets the connection up anew, and nobody
-		 * is told, as nothing has changed for them.
-		 */
-		if (conn_state_swap(conn, BT_CONN_DISCONNECTING, BT_CONN_CONNECTED)) {
-			LOG_WRN("Unable to disconnect %p (%d)", conn, result);
-
-			/* Let it go on sending, also when it was a failure to
-			 * send that it was to be disconnected for. The TX
-			 * processor has taken it off its list while it was
-			 * not connected.
-			 */
-			atomic_clear_bit(conn->flags, BT_CONN_TX_FAILED);
-			bt_conn_data_ready(conn);
-		}
-	} else {
-		/* Accepted, or the Host is going down or has given up on the
-		 * controller, either of which takes care of the connection.
-		 */
-	}
-
-	/* May be the last reference */
-	bt_conn_unref(conn);
-}
-
-static const struct bt_hci_cmd_desc disconnect_cmd = {
-	.opcode = BT_HCI_OP_DISCONNECT,
-	.encode = disconnect_encode,
-	.done = disconnect_done,
-};
-
 static int conn_disconnect(struct bt_conn *conn, uint8_t reason)
 {
 	int err;
@@ -2285,7 +2620,7 @@ static int conn_disconnect(struct bt_conn *conn, uint8_t reason)
 	}
 
 	/* Everything that the completion relies on is in place before the
-	 * request is queued, as it may complete at once: the state and the
+	 * command is requested, as it may complete at once: the state and the
 	 * reason. The state is only changed if the connection is still
 	 * connected: a disconnection may have overtaken the caller, which
 	 * found it connected.
@@ -2296,21 +2631,12 @@ static int conn_disconnect(struct bt_conn *conn, uint8_t reason)
 
 	conn->disconnect_reason = reason;
 
-	err = conn_hci_send(conn, &disconnect_cmd);
-	if (err == 0) {
-		return 0;
-	}
-
-	if (err == -EBUSY) {
-		/* Requested already */
-		return 0;
-	}
-
-	/* Nothing was queued. If the connection is not as it was either, a
-	 * disconnection has got in between, which is what the caller is
-	 * told.
-	 */
-	if (!conn_state_swap(conn, BT_CONN_DISCONNECTING, BT_CONN_CONNECTED)) {
+	err = conn_cmd_request(conn, BT_CONN_CMD_DISCONNECT);
+	if (err != 0 && !conn_state_swap(conn, BT_CONN_DISCONNECTING, BT_CONN_CONNECTED)) {
+		/* Nothing is sent, and the connection is not as it was
+		 * either: a disconnection has got in between, which is what
+		 * the caller is told.
+		 */
 		err = -ENOTCONN;
 	}
 
@@ -2545,8 +2871,25 @@ bool bt_conn_le_param_req(struct bt_conn *conn, struct bt_le_conn_param *param)
 	return true;
 }
 
-static int send_conn_le_param_update(struct bt_conn *conn,
-				const struct bt_le_conn_param *param)
+/* Keep the parameters of an update: for the fallback to L2CAP, and for the
+ * command of an update that the Host starts on its own, which takes them
+ * with the host lock held when it is sent.
+ */
+static void conn_update_params_store(struct bt_conn *conn, const struct bt_le_conn_param *param)
+{
+	bt_dev_lock();
+	conn->le.interval_min = param->interval_min;
+	conn->le.interval_max = param->interval_max;
+	conn->le.pending_latency = param->latency;
+	conn->le.pending_timeout = param->timeout;
+	bt_dev_unlock();
+}
+
+/* A caller that passes the response of the controller on waits for it. The
+ * Host does not when it starts an update on its own.
+ */
+static int send_conn_le_param_update(struct bt_conn *conn, const struct bt_le_conn_param *param,
+				     bool wait)
 {
 	LOG_DBG("conn %p features 0x%02x params (%d-%d %d %d)", conn, conn->le.features[0],
 		param->interval_min, param->interval_max, param->latency, param->timeout);
@@ -2565,14 +2908,15 @@ static int send_conn_le_param_update(struct bt_conn *conn,
 	     (conn->role == BT_HCI_ROLE_CENTRAL)) {
 		int rc;
 
+		if (!wait) {
+			return bt_conn_le_conn_update_nowait(conn, param);
+		}
+
 		rc = bt_conn_le_conn_update(conn, param);
 
 		/* store those in case of fallback to L2CAP */
 		if (rc == 0) {
-			conn->le.interval_min = param->interval_min;
-			conn->le.interval_max = param->interval_max;
-			conn->le.pending_latency = param->latency;
-			conn->le.pending_timeout = param->timeout;
+			conn_update_params_store(conn, param);
 		}
 
 		return rc;
@@ -2719,7 +3063,7 @@ static void deferred_work(struct k_work *work)
 					 conn->le.pending_latency,
 					 conn->le.pending_timeout);
 
-		err = send_conn_le_param_update(conn, param);
+		err = send_conn_le_param_update(conn, param, false);
 		if (!err) {
 			atomic_clear_bit(conn->flags,
 					 BT_CONN_PERIPHERAL_PARAM_AUTO_UPDATE);
@@ -2736,7 +3080,7 @@ static void deferred_work(struct k_work *work)
 				CONFIG_BT_PERIPHERAL_PREF_LATENCY,
 				CONFIG_BT_PERIPHERAL_PREF_TIMEOUT);
 
-		err = send_conn_le_param_update(conn, param);
+		err = send_conn_le_param_update(conn, param, false);
 		if (!err) {
 			atomic_set_bit(conn->flags,
 				       BT_CONN_PERIPHERAL_PARAM_AUTO_UPDATE);
@@ -2923,32 +3267,47 @@ void bt_conn_identity_resolved(struct bt_conn *conn)
 	}
 }
 
-int bt_conn_le_start_encryption(struct bt_conn *conn, uint8_t rand[8],
-				uint8_t ediv[2], const uint8_t *ltk, size_t len)
+/* An HCI LE Start Encryption command that its sender waits for. The
+ * connection is borrowed from the sender, as for struct conn_update_req.
+ */
+struct encrypt_req {
+	struct bt_hci_cmd_op_fut cmd;
+	struct bt_conn *conn;
+};
+
+static int encrypt_req_encode(struct net_buf *buf, struct bt_hci_cmd_op *op)
 {
-	struct bt_hci_cp_le_start_encryption *cp;
-	struct net_buf *buf;
+	struct encrypt_req *req = CONTAINER_OF(op, struct encrypt_req, cmd.op);
 
-	if (len > sizeof(cp->ltk)) {
-		return -EINVAL;
+	return encrypt_encode(req->conn, buf);
+}
+
+static const struct bt_hci_cmd_desc encrypt_req_cmd = {
+	.opcode = BT_HCI_OP_LE_START_ENCRYPTION,
+	.encode = encrypt_req_encode,
+};
+
+int bt_conn_le_start_encryption(struct bt_conn *conn, bool wait)
+{
+	struct encrypt_req req = {
+		.conn = conn,
+	};
+	int err;
+
+	if (!CONN_CMD_ENCRYPT_ENABLED) {
+		return -ENOTSUP;
 	}
 
-	buf = bt_hci_cmd_alloc(K_FOREVER);
-	if (!buf) {
-		return -ENOBUFS;
+	if (!wait) {
+		return conn_cmd_request(conn, BT_CONN_CMD_ENCRYPT);
 	}
 
-	cp = net_buf_add(buf, sizeof(*cp));
-	cp->handle = sys_cpu_to_le16(conn->handle);
-	(void)memcpy(cp->rand, rand, sizeof(cp->rand));
-	(void)memcpy(cp->ediv, ediv, sizeof(cp->ediv));
-
-	memcpy(cp->ltk, ltk, len);
-	if (len < sizeof(cp->ltk)) {
-		(void)memset(cp->ltk + len, 0, sizeof(cp->ltk) - len);
+	err = bt_hci_cmd_send_async(&req.cmd, &encrypt_req_cmd);
+	if (err != 0) {
+		return err;
 	}
 
-	return bt_hci_cmd_send_sync(BT_HCI_OP_LE_START_ENCRYPTION, buf, NULL);
+	return conn_req_wait(&req.cmd);
 }
 #endif /* CONFIG_BT_SMP */
 
@@ -4245,20 +4604,17 @@ int bt_conn_le_param_update(struct bt_conn *conn,
 
 	if (IS_ENABLED(CONFIG_BT_CENTRAL) &&
 	    conn->role == BT_CONN_ROLE_CENTRAL) {
-		return send_conn_le_param_update(conn, param);
+		return send_conn_le_param_update(conn, param, true);
 	}
 
 	if (IS_ENABLED(CONFIG_BT_PERIPHERAL)) {
 		/* if peripheral conn param update timer expired just send request */
 		if (atomic_test_bit(conn->flags, BT_CONN_PERIPHERAL_PARAM_UPDATE)) {
-			return send_conn_le_param_update(conn, param);
+			return send_conn_le_param_update(conn, param, true);
 		}
 
 		/* store new conn params to be used by update timer */
-		conn->le.interval_min = param->interval_min;
-		conn->le.interval_max = param->interval_max;
-		conn->le.pending_latency = param->latency;
-		conn->le.pending_timeout = param->timeout;
+		conn_update_params_store(conn, param);
 		atomic_set_bit(conn->flags, BT_CONN_PERIPHERAL_PARAM_SET);
 	}
 
@@ -4678,26 +5034,51 @@ int bt_conn_le_create_synced(const struct bt_le_ext_adv *adv,
 }
 #endif /* CONFIG_BT_CENTRAL */
 
+/* An HCI LE Connection Update command that its sender waits for. All that it
+ * takes is on the stack of the sender, and the connection is borrowed from
+ * the sender too: the command needs no reference of its own, as the sender
+ * does not return before the command has completed.
+ */
+struct conn_update_req {
+	struct bt_hci_cmd_op_fut cmd;
+	struct bt_conn *conn;
+	const struct bt_le_conn_param *param;
+};
+
+static int conn_update_req_encode(struct net_buf *buf, struct bt_hci_cmd_op *op)
+{
+	struct conn_update_req *req = CONTAINER_OF(op, struct conn_update_req, cmd.op);
+
+	return conn_update_add(req->conn, buf, req->param);
+}
+
+static const struct bt_hci_cmd_desc conn_update_req_cmd = {
+	.opcode = BT_HCI_OP_LE_CONN_UPDATE,
+	.encode = conn_update_req_encode,
+};
+
 int bt_conn_le_conn_update(struct bt_conn *conn,
 			   const struct bt_le_conn_param *param)
 {
-	struct hci_cp_le_conn_update *conn_update;
-	struct net_buf *buf;
+	struct conn_update_req req = {
+		.conn = conn,
+		.param = param,
+	};
+	int err;
 
-	buf = bt_hci_cmd_alloc(K_FOREVER);
-	if (!buf) {
-		return -ENOBUFS;
+	err = bt_hci_cmd_send_async(&req.cmd, &conn_update_req_cmd);
+	if (err != 0) {
+		return err;
 	}
 
-	conn_update = net_buf_add(buf, sizeof(*conn_update));
-	(void)memset(conn_update, 0, sizeof(*conn_update));
-	conn_update->handle = sys_cpu_to_le16(conn->handle);
-	conn_update->conn_interval_min = sys_cpu_to_le16(param->interval_min);
-	conn_update->conn_interval_max = sys_cpu_to_le16(param->interval_max);
-	conn_update->conn_latency = sys_cpu_to_le16(param->latency);
-	conn_update->supervision_timeout = sys_cpu_to_le16(param->timeout);
+	return conn_req_wait(&req.cmd);
+}
 
-	return bt_hci_cmd_send_sync(BT_HCI_OP_LE_CONN_UPDATE, buf, NULL);
+int bt_conn_le_conn_update_nowait(struct bt_conn *conn, const struct bt_le_conn_param *param)
+{
+	conn_update_params_store(conn, param);
+
+	return conn_cmd_request(conn, BT_CONN_CMD_CONN_UPDATE);
 }
 
 #if defined(CONFIG_BT_SMP) || defined(CONFIG_BT_CLASSIC)
