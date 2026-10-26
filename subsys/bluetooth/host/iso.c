@@ -3375,6 +3375,7 @@ static int hci_le_big_create_sync(const struct bt_le_per_adv_sync *sync, uint32_
 		if (param->bis_bitfield & BT_ISO_BIS_INDEX_BIT(i)) {
 			if (bit_idx == big->num_bis) {
 				LOG_DBG("BIG cannot contain %u BISes", bit_idx + 1);
+				net_buf_unref(buf);
 				return -EINVAL;
 			}
 			req->bis[bit_idx++] = i;
@@ -3384,6 +3385,7 @@ static int hci_le_big_create_sync(const struct bt_le_per_adv_sync *sync, uint32_
 	if (bit_idx != big->num_bis) {
 		LOG_DBG("Number of bits in bis_bitfield (%u) doesn't match num_bis (%u)", bit_idx,
 			big->num_bis);
+		net_buf_unref(buf);
 		return -EINVAL;
 	}
 

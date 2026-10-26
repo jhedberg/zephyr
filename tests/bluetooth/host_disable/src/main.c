@@ -15,6 +15,7 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/hci.h>
 #include <zephyr/bluetooth/hci_types.h>
+#include <zephyr/bluetooth/iso.h>
 #include <zephyr/bluetooth/l2cap.h>
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
@@ -1397,6 +1398,47 @@ static ZTEST(bt_per_adv_sync, test_sync_established_before_create_returns)
 	zassert_ok(err, "Creating the sync failed (%d)", err);
 	zassert_equal_ptr(sync_app_sync, synced_sync, "Another sync was created");
 }
+
+#if defined(CONFIG_BT_ISO_SYNC_RECEIVER)
+/* A BIG sync that the Host rejects only once it has the command buffer, as the
+ * BIS bitfield names more BISes than there are channels, must give the buffer
+ * back.
+ */
+static ZTEST(bt_per_adv_sync, test_big_sync_invalid_bis)
+{
+	static struct bt_iso_chan_io_qos rx_qos;
+	static struct bt_iso_chan_qos qos = {
+		.rx = &rx_qos,
+	};
+	static struct bt_iso_chan_ops ops;
+	static struct bt_iso_chan chan = {
+		.ops = &ops,
+		.qos = &qos,
+	};
+	struct bt_iso_chan *chans[] = {&chan};
+	struct bt_iso_big_sync_param param = {
+		.bis_channels = chans,
+		.num_bis = ARRAY_SIZE(chans),
+		.bis_bitfield = BT_ISO_BIS_INDEX_BIT(1) | BT_ISO_BIS_INDEX_BIT(2),
+		.sync_timeout = BT_ISO_SYNC_TIMEOUT_MIN,
+	};
+	struct bt_le_per_adv_sync *sync;
+	struct bt_iso_big *big;
+	struct net_buf *buf;
+	int err;
+
+	sync = sync_create_established();
+
+	for (size_t i = 0U; i < CONFIG_BT_BUF_CMD_TX_COUNT; i++) {
+		err = bt_iso_big_sync(sync, &param, &big);
+		zassert_equal(err, -EINVAL, "The BIG sync gave %d", err);
+	}
+
+	buf = bt_hci_cmd_alloc(K_NO_WAIT);
+	zassert_not_null(buf, "The command buffers were not given back");
+	net_buf_unref(buf);
+}
+#endif /* CONFIG_BT_ISO_SYNC_RECEIVER */
 
 #if defined(CONFIG_BT_PER_ADV_SYNC_RSP)
 /* As test_sync_delete_waiting_for_buffer, with the application thread choosing
