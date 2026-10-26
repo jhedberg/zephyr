@@ -2295,6 +2295,7 @@ int bt_le_per_adv_sync_create(const struct bt_le_per_adv_sync_param *param,
 	struct bt_hci_cp_le_per_adv_create_sync *cp;
 	struct net_buf *buf;
 	struct bt_le_per_adv_sync *per_adv_sync;
+	struct bt_le_per_adv_sync *prev_out_sync;
 	struct bt_per_adv_sync_cmd check;
 	uint32_t gen;
 	int err;
@@ -2348,6 +2349,12 @@ int bt_le_per_adv_sync_create(const struct bt_le_per_adv_sync_param *param,
 
 	atomic_set_bit(per_adv_sync->flags, BT_PER_ADV_SYNC_SYNCING);
 	gen = per_adv_sync->gen;
+
+	/* Before the sync can be reported to the callbacks, which may look
+	 * for it there
+	 */
+	prev_out_sync = *out_sync;
+	*out_sync = per_adv_sync;
 
 	/* Syncing requires that scan is enabled. If the caller doesn't enable
 	 * scan first, we enable it here, and disable it once the sync has been
@@ -2422,19 +2429,11 @@ int bt_le_per_adv_sync_create(const struct bt_le_per_adv_sync_param *param,
 		goto fail;
 	}
 
-	bt_dev_lock();
-
-	if (per_adv_sync->gen != gen) {
-		/* Deleted meanwhile: by bt_disable(), or as the sync
-		 * failed to be established.
-		 */
-		bt_dev_unlock();
-		return -ECANCELED;
+	if (per_adv_sync_deleted(per_adv_sync, gen)) {
+		/* By bt_disable(), or as the sync failed to be established */
+		err = -ECANCELED;
+		goto out_sync_restore;
 	}
-
-	*out_sync = per_adv_sync;
-
-	bt_dev_unlock();
 
 	return 0;
 
@@ -2443,7 +2442,8 @@ fail:
 
 	if (per_adv_sync->gen != gen) {
 		bt_dev_unlock();
-		return -ECANCELED;
+		err = -ECANCELED;
+		goto out_sync_restore;
 	}
 
 	atomic_clear_bit(scan_state.scan_flags, BT_LE_SCAN_USER_PER_SYNC);
@@ -2452,6 +2452,12 @@ fail:
 	bt_dev_unlock();
 
 	per_adv_sync_scan_update();
+
+out_sync_restore:
+	/* Unless a callback has changed it meanwhile */
+	if (*out_sync == per_adv_sync) {
+		*out_sync = prev_out_sync;
+	}
 
 	return err;
 }
