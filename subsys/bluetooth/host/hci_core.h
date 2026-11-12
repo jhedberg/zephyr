@@ -502,14 +502,11 @@ struct bt_dev {
 	sys_slist_t		cmd_tx_queue;
 	struct k_spinlock	cmd_lock;
 
-#if defined(CONFIG_BT_CONN)
 	/* Asynchronous commands waiting for a command buffer, and those whose
-	 * completion callback is still to run. Protected by cmd_lock. Built
-	 * with the one kind of user that there is so far.
+	 * completion callback is still to run. Protected by cmd_lock.
 	 */
 	sys_slist_t		cmd_op_queue;
 	sys_slist_t		cmd_done_list;
-#endif /* CONFIG_BT_CONN */
 
 	const struct device *hci;
 
@@ -647,6 +644,56 @@ struct bt_keys *bt_id_find_conflict(struct bt_keys *candidate);
 
 int bt_setup_random_id_addr(void);
 int bt_setup_public_id_addr(void);
+
+struct bt_hci_cmd_op;
+struct bt_future;
+
+/**
+ * @brief Enable Bluetooth without waiting for the controller
+ *
+ * Does what bt_enable() does, and returns once the transport is open and the
+ * initialization of the controller has started. The caller does not wait for
+ * the controller: the commands of the initialization are sent as the
+ * controller responds to them, and @p fut is resolved with what bt_enable(NULL)
+ * would have returned. What still waits for its commands: the deprecated
+ * setup() of the driver, in the caller, and the BR/EDR initialization and LE
+ * Rand, where they are used, on the Bluetooth workqueue. bt_enable(cb) is the
+ * same enable with a callback.
+ *
+ * The future is resolved on the Bluetooth workqueue, which takes the
+ * initialization from one stage to the next, or before the call returns when
+ * the initialization fails before its first command. A thread that waits for
+ * it must not be that workqueue, nor the system workqueue in a build without
+ * @kconfig{CONFIG_BT_TX_PROCESSOR_THREAD}, which sends the commands.
+ *
+ * A call that returns 0 initializes @p fut, which then belongs to the
+ * initialization until it is resolved, and has to stay valid after that until
+ * its result has been collected with bt_future_wait() or bt_future_is_done().
+ * It is therefore a static variable, or part of an object that outlives the
+ * initialization. A caller that only waits for the result where it enables
+ * has bt_enable(NULL), which also works where a wait for the future does not.
+ * Nothing cancels the initialization, so a function that has the future on
+ * its stack waits for it without a timeout before it returns.
+ *
+ * The future is always resolved, except when a controller that has responded
+ * before stops responding, which trips the same assertion as for a
+ * synchronous command. A call that fails does not touch it.
+ *
+ * @param fut Future that is resolved with 0 once Bluetooth is ready, or with
+ *            a negative error. With @kconfig{CONFIG_BT_SETTINGS}, 0 can also
+ *            mean that the identity has to be loaded from the settings first,
+ *            as after bt_enable().
+ *
+ * @retval 0 The initialization of the controller has started.
+ * @retval -errno What bt_enable() returns for a failure that is found before
+ *                the initialization of the controller starts.
+ */
+int bt_enable_async(struct bt_future *fut);
+
+/* Completion callback of the sequences of commands that bt_enable() goes
+ * through, see init_stages in hci_core.c
+ */
+void bt_init_stage_done(struct bt_hci_cmd_op *op, int result);
 
 void bt_finalize_init(int err);
 

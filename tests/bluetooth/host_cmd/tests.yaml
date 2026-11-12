@@ -33,3 +33,8 @@ tests:
       - no_reset.overlay
     extra_configs:
       - CONFIG_BT_TX_PROCESSOR_THREAD=n
+  # The vendor HCI extensions, whose presence the Host guesses here
+  # (CONFIG_BT_HCI_VS_EXT_DETECT is on by default without a controller)
+  bluetooth.host_cmd.vs:
+    extra_configs:
+      - CONFIG_BT_HCI_VS=y
